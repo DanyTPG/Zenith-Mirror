@@ -1,0 +1,12 @@
+{
+  "app_id": 123456,
+  "app_hash": "YOUR_TELEGRAM_APP_HASH",
+  "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
+  "phone_number": "+1234567890",
+  "session_file": "session.json",
+  "gdrive_sa_file": "service_account.json",
+  "gdrive_folder_id": "1A2B3C4D5E6F7G8H9I0J",
+  "owner_id": 987654321,
+  "allowed_users": [11223344, 55667788],
+  "max_concurrency": 3
+}

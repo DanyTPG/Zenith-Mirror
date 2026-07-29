@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
 type LeechPipeline struct {
@@ -45,7 +44,6 @@ func (lp *LeechPipeline) DownloadHTTP(ctx context.Context, rawURL string, header
 
 	fileName := "downloaded_file"
 	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-		// Basic filename extraction
 		fileName = cd
 	}
 

@@ -16,19 +16,27 @@ const (
 	JobTypeLeech  JobType = "LEECH"
 )
 
+type JobPhase string
+
+const (
+	PhaseDownloading JobPhase = "Downloading"
+	PhaseUploading   JobPhase = "Uploading"
+)
+
 type Job struct {
-	ID          string
-	Type        JobType
-	FileName    string
-	Size        int64
-	ReadBytes   int64
-	Speed       float64
-	ETA         time.Duration
-	Status      string
-	UserID      int64
-	Ctx         context.Context
-	Cancel      context.CancelFunc
-	StartTime   time.Time
+	ID        string
+	Type      JobType
+	FileName  string
+	Size      int64
+	Phase     JobPhase
+	ReadBytes int64
+	Speed     float64
+	ETA       time.Duration
+	Status    string
+	UserID    int64
+	Ctx       context.Context
+	Cancel    context.CancelFunc
+	StartTime time.Time
 }
 
 type JobManager struct {
@@ -67,6 +75,7 @@ func (jm *JobManager) CreateJob(parentCtx context.Context, jobType JobType, name
 		Type:      jobType,
 		FileName:  name,
 		Size:      size,
+		Phase:     PhaseDownloading,
 		Status:    "Starting",
 		UserID:    userID,
 		Ctx:       ctx,

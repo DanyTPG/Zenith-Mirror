@@ -116,8 +116,8 @@ func (ts *TelegramService) buildStatusText() string {
 		if j.ETA > 0 {
 			etaStr = j.ETA.Round(time.Second).String()
 		}
-		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  %s\n  Size: %s / %s | Speed: %s/s | ETA: %s\n  Status: %s\n\n",
-			j.ID, j.Type, j.FileName, bar, FormatBytes(j.ReadBytes), FormatBytes(j.Size), FormatBytes(int64(j.Speed)), etaStr, j.Status)
+		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  Phase: [%s] %s\n  Size: %s / %s | Speed: %s/s | ETA: %s\n  Status: %s\n\n",
+			j.ID, j.Type, j.FileName, j.Phase, bar, FormatBytes(j.ReadBytes), FormatBytes(j.Size), FormatBytes(int64(j.Speed)), etaStr, j.Status)
 	}
 	return statusText
 }
@@ -287,9 +287,17 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size)
-	job.Status = "Streaming from Telegram to Google Drive"
+	job.Phase = PhaseDownloading
+	job.Status = "Downloading from Telegram"
 
 	pr, pw := io.Pipe()
+
+	// Wrap pipe reader in progress tracking for downloading phase
+	downloadProgressReader := NewProgressReader(pr, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
 
 	go func() {
 		defer pw.Close()
@@ -302,14 +310,11 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 		}
 	}()
 
-	progressReader := NewProgressReader(pr, job.Size, func(read, total int64, speed float64, eta time.Duration) {
-		job.ReadBytes = read
-		job.Speed = speed
-		job.ETA = eta
-		slog.Info("mirror progress", "job_id", job.ID, "read", FormatBytes(read), "total", FormatBytes(total), "speed_kbps", speed/1024)
-	})
+	// Switch phase to Uploading when GDrive uploader starts consuming bytes
+	job.Phase = PhaseUploading
+	job.Status = "Streaming to Google Drive"
 
-	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, job.Size)
+	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, downloadProgressReader, job.Size)
 	if err != nil {
 		slog.Error("gdrive upload failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
@@ -348,6 +353,8 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing leech job", "job_id", job.ID, "url", rawURL)
+	job.Phase = PhaseDownloading
+	job.Status = "Downloading from HTTP"
 
 	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
 	if err != nil {
@@ -378,7 +385,6 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	if job.FileName == "" {
 		job.FileName = "downloaded_file.bin"
 	}
-	job.Status = "Downloading & Uploading to Telegram"
 
 	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
@@ -387,6 +393,8 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	})
 
 	slog.Info("uploading stream to telegram", "job_id", job.ID, "size", FormatBytes(job.Size))
+	job.Phase = PhaseUploading
+	job.Status = "Uploading to Telegram"
 
 	uploadedFile, err := ts.uploader.FromReader(job.Ctx, job.FileName, pr)
 	if err != nil {

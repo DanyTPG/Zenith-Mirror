@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -72,6 +74,8 @@ func (ts *TelegramService) registerRoutes() {
 			senderID = peer.UserID
 		}
 
+		slog.Info("received telegram message", "sender_id", senderID, "text", msg.Message)
+
 		if !ts.cfg.IsAllowed(senderID) {
 			slog.Warn("unauthorized user attempted command", "user_id", senderID)
 			return nil
@@ -85,7 +89,7 @@ func (ts *TelegramService) registerRoutes() {
 		} else if strings.HasPrefix(text, "/mirror") {
 			return ts.handleMirror(ctx, entities, update, msg)
 		} else if strings.HasPrefix(text, "/leech") {
-			return ts.handleLeech(ctx, entities, update, msg, text)
+			return ts.handleLeech(ctx, entities, update, msg, text, senderID)
 		}
 
 		return nil
@@ -101,8 +105,8 @@ func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entitie
 
 	statusText := "Active Jobs:\n\n"
 	for _, j := range jobs {
-		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  Size: %s | Progress: %s\n\n",
-			j.ID, j.Type, j.FileName, FormatBytes(j.Size), FormatBytes(j.ReadBytes))
+		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  Size: %s | Progress: %s\n  Status: %s\n\n",
+			j.ID, j.Type, j.FileName, FormatBytes(j.Size), FormatBytes(j.ReadBytes), j.Status)
 	}
 
 	_, err := ts.sender.Reply(entities, update).Text(ctx, statusText)
@@ -129,15 +133,83 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	return err
 }
 
-func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string) error {
+func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /leech <url>")
 		return err
 	}
 	rawURL := parts[1]
-	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Starting leech for %s...", rawURL))
-	return err
+
+	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, rawURL, 0, userID)
+	if err != nil {
+		slog.Error("failed creating leech job", "error", err)
+		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		return replyErr
+	}
+
+	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
+	_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Starting leech [%s] for %s...", job.ID, rawURL))
+
+	go ts.executeLeechJob(job, rawURL, entities, update)
+
+	return nil
+}
+
+func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.Entities, update *tg.UpdateNewMessage) {
+	defer ts.jm.FinishJob(job.ID)
+
+	slog.Info("executing leech job", "job_id", job.ID, "url", rawURL)
+
+	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
+	if err != nil {
+		slog.Error("invalid url for leech", "job_id", job.ID, "error", err)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
+
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("leech download request failed", "job_id", job.ID, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Error("leech download non-200 status", "job_id", job.ID, "status", resp.Status)
+		return
+	}
+
+	job.Size = resp.ContentLength
+	job.FileName = "downloaded_file"
+	job.Status = "Downloading"
+
+	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+		slog.Info("leech progress", "job_id", job.ID, "read", FormatBytes(read), "total", FormatBytes(total), "speed_kbps", speed/1024)
+	})
+
+	// Stream upload to Telegram
+	slog.Info("uploading stream to telegram", "job_id", job.ID, "size", FormatBytes(job.Size))
+	job.Status = "Uploading to Telegram"
+
+	uploadedFile, err := ts.uploader.FromReader(job.Ctx, job.FileName, pr)
+	if err != nil {
+		slog.Error("telegram upload failed", "job_id", job.ID, "error", err)
+		return
+	}
+
+	document := message.UploadedDocument(uploadedFile).Filename(job.FileName)
+	if _, err := ts.sender.Reply(entities, update).Media(job.Ctx, document); err != nil {
+		slog.Error("failed sending media message", "job_id", job.ID, "error", err)
+		return
+	}
+
+	job.Status = "Completed"
+	slog.Info("leech job completed successfully", "job_id", job.ID)
 }
 
 func (ts *TelegramService) Run(ctx context.Context, handler func(ctx context.Context) error) error {

@@ -303,7 +303,7 @@ func (ts *TelegramService) buildStatusText() string {
 			phaseName = "Upload"
 		}
 
-		statusText += fmt.Sprintf("%d.%s: %s\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n/cancel %s\n\n",
+		statusText += fmt.Sprintf("%d.%s: `%s`\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n`/cancel %s`\n\n",
 			i+1, phaseName, j.FileName,
 			bar, pct,
 			FormatBytes(j.ReadBytes), FormatBytes(j.Size),

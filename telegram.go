@@ -175,6 +175,29 @@ func (ts *TelegramService) buildStatusText() string {
 	return statusText
 }
 
+func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
+	switch u := updates.(type) {
+	case *tg.Updates:
+		for _, up := range u.GetUpdates() {
+			switch unm := up.(type) {
+			case *tg.UpdateNewMessage:
+				if m, ok := unm.Message.(*tg.Message); ok {
+					return m.ID
+				}
+			case *tg.UpdateNewChannelMessage:
+				if m, ok := unm.Message.(*tg.Message); ok {
+					return m.ID
+				}
+			}
+		}
+	case *tg.UpdateShortMessage:
+		return u.ID
+	case *tg.UpdateShortSentMessage:
+		return u.ID
+	}
+	return 0
+}
+
 func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) {
 	delay := ts.cfg.StatusRefreshDelay
 	if delay <= 0 {
@@ -190,17 +213,8 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 		return
 	}
 
-	var statusMsgID int
-	if u, ok := updates.(*tg.Updates); ok {
-		for _, up := range u.GetUpdates() {
-			if newMsg, ok := up.(*tg.UpdateNewMessage); ok {
-				statusMsgID = newMsg.Message.GetID()
-				break
-			}
-		}
-	} else if uShort, ok := updates.(*tg.UpdateShortMessage); ok {
-		statusMsgID = uShort.ID
-	}
+	statusMsgID := extractMsgIDFromUpdates(updates)
+	slog.Info("created live status message", "status_msg_id", statusMsgID)
 
 	var lastText string = initialText
 
@@ -209,17 +223,25 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 		case <-jobCtx.Done():
 			if statusMsgID > 0 {
 				slog.Info("deleting completed job live status message", "status_msg_id", statusMsgID)
-				_, _ = ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
+				_, delErr := ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
 					Revoke: true,
 					ID:     []int{statusMsgID},
 				})
+				if delErr != nil {
+					slog.Error("failed to delete live status message", "status_msg_id", statusMsgID, "error", delErr)
+				}
 			}
 			return
 		case <-ticker.C:
 			currentText := ts.buildStatusText()
 			if currentText != lastText && statusMsgID > 0 {
-				_, _ = ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, styling.Plain(currentText))
-				lastText = currentText
+				slog.Info("editing live status message", "status_msg_id", statusMsgID)
+				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, styling.Plain(currentText))
+				if editErr != nil {
+					slog.Error("failed editing live status message", "status_msg_id", statusMsgID, "error", editErr)
+				} else {
+					lastText = currentText
+				}
 			}
 		}
 	}

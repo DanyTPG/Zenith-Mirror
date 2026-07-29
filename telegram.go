@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -87,7 +88,7 @@ func (ts *TelegramService) registerRoutes() {
 		} else if strings.HasPrefix(text, "/cancel") {
 			return ts.handleCancel(ctx, entities, update, msg, text)
 		} else if strings.HasPrefix(text, "/mirror") {
-			return ts.handleMirror(ctx, entities, update, msg)
+			return ts.handleMirror(ctx, entities, update, msg, senderID)
 		} else if strings.HasPrefix(text, "/leech") {
 			return ts.handleLeech(ctx, entities, update, msg, text, senderID)
 		}
@@ -97,20 +98,62 @@ func (ts *TelegramService) registerRoutes() {
 }
 
 func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
+	text := ts.buildStatusText()
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(text))
+	return err
+}
+
+func (ts *TelegramService) buildStatusText() string {
 	jobs := ts.jm.GetActiveJobs()
 	if len(jobs) == 0 {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "No active transfer jobs.")
-		return err
+		return "No active transfer jobs."
 	}
 
-	statusText := "Active Jobs:\n\n"
+	statusText := "Zenith-Mirror Active Transfers:\n\n"
 	for _, j := range jobs {
-		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  Size: %s | Progress: %s\n  Status: %s\n\n",
-			j.ID, j.Type, j.FileName, FormatBytes(j.Size), FormatBytes(j.ReadBytes), j.Status)
+		bar := RenderProgressBar(j.ReadBytes, j.Size, 10)
+		etaStr := "N/A"
+		if j.ETA > 0 {
+			etaStr = j.ETA.Round(time.Second).String()
+		}
+		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  %s\n  Size: %s / %s | Speed: %s/s | ETA: %s\n  Status: %s\n\n",
+			j.ID, j.Type, j.FileName, bar, FormatBytes(j.ReadBytes), FormatBytes(j.Size), FormatBytes(int64(j.Speed)), etaStr, j.Status)
+	}
+	return statusText
+}
+
+func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) {
+	delay := ts.cfg.StatusRefreshDelay
+	if delay <= 0 {
+		delay = 5
+	}
+	ticker := time.NewTicker(time.Duration(delay) * time.Second)
+	defer ticker.Stop()
+
+	initialText := ts.buildStatusText()
+	statusBuilder := ts.sender.Reply(entities, update)
+	_, err := statusBuilder.StyledText(jobCtx, styling.Plain(initialText))
+	if err != nil {
+		slog.Error("failed sending live status message", "error", err)
+		return
 	}
 
-	_, err := ts.sender.Reply(entities, update).Text(ctx, statusText)
-	return err
+	var lastText string = initialText
+
+	for {
+		select {
+		case <-jobCtx.Done():
+			finalText := fmt.Sprintf("✅ Job Finished!\n\n%s", ts.buildStatusText())
+			_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), styling.Plain(finalText))
+			return
+		case <-ticker.C:
+			currentText := ts.buildStatusText()
+			if currentText != lastText {
+				_, _ = ts.sender.Reply(entities, update).StyledText(jobCtx, styling.Plain(currentText))
+				lastText = currentText
+			}
+		}
+	}
 }
 
 func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string) error {
@@ -128,9 +171,52 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	return err
 }
 
-func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
-	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Bold("Mirror command received."), styling.Plain(" Send or reply to media to mirror to Google Drive."))
-	return err
+func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, userID int64) error {
+	if msg.ReplyTo == nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror to upload it to Google Drive.")
+		return err
+	}
+
+	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, "telegram_media", 0, userID)
+	if err != nil {
+		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		return replyErr
+	}
+
+	go ts.startLiveStatusUpdater(job.Ctx, entities, update)
+	go ts.executeMirrorJob(job, entities, update)
+
+	return nil
+}
+
+func (ts *TelegramService) executeMirrorJob(job *Job, entities tg.Entities, update *tg.UpdateNewMessage) {
+	defer ts.jm.FinishJob(job.ID)
+
+	slog.Info("executing mirror job", "job_id", job.ID)
+	job.Status = "Mirroring Telegram Media to Google Drive"
+
+	pr, pw := io.Pipe()
+
+	progressReader := NewProgressReader(pr, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
+
+	go func() {
+		defer pw.Close()
+	}()
+
+	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, job.Size)
+	if err != nil {
+		slog.Error("gdrive upload failed", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
+		return
+	}
+
+	job.Status = "Completed"
+	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
+	_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("✅ Mirror Complete!\nGoogle Drive Link: %s", driveURL))
 }
 
 func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
@@ -149,8 +235,8 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	}
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
-	_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Starting leech [%s] for %s...", job.ID, rawURL))
 
+	go ts.startLiveStatusUpdater(job.Ctx, entities, update)
 	go ts.executeLeechJob(job, rawURL, entities, update)
 
 	return nil
@@ -164,6 +250,7 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
 	if err != nil {
 		slog.Error("invalid url for leech", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
 		return
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
@@ -172,33 +259,37 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.Error("leech download request failed", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		slog.Error("leech download non-200 status", "job_id", job.ID, "status", resp.Status)
+		job.Status = fmt.Sprintf("HTTP Error %s", resp.Status)
 		return
 	}
 
 	job.Size = resp.ContentLength
-	job.FileName = "downloaded_file"
-	job.Status = "Downloading"
+	urlParts := strings.Split(rawURL, "/")
+	job.FileName = urlParts[len(urlParts)-1]
+	if job.FileName == "" {
+		job.FileName = "downloaded_file.bin"
+	}
+	job.Status = "Downloading & Uploading to Telegram"
 
 	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
 		job.Speed = speed
 		job.ETA = eta
-		slog.Info("leech progress", "job_id", job.ID, "read", FormatBytes(read), "total", FormatBytes(total), "speed_kbps", speed/1024)
 	})
 
-	// Stream upload to Telegram
 	slog.Info("uploading stream to telegram", "job_id", job.ID, "size", FormatBytes(job.Size))
-	job.Status = "Uploading to Telegram"
 
 	uploadedFile, err := ts.uploader.FromReader(job.Ctx, job.FileName, pr)
 	if err != nil {
 		slog.Error("telegram upload failed", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Upload Failed: %v", err)
 		return
 	}
 

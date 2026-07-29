@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -39,7 +40,7 @@ func (pr *ProgressReader) notifyIfNeeded() {
 		return
 	}
 	now := time.Now()
-	if now.Sub(pr.lastNotify) < 2*time.Second {
+	if now.Sub(pr.lastNotify) < 1*time.Second {
 		return
 	}
 	pr.lastNotify = now
@@ -50,7 +51,7 @@ func (pr *ProgressReader) notifyIfNeeded() {
 		return
 	}
 
-	speed := float64(read) / elapsed // bytes per second
+	speed := float64(read) / elapsed
 	var eta time.Duration
 	if speed > 0 && pr.totalBytes > read {
 		remainingBytes := pr.totalBytes - read
@@ -61,6 +62,9 @@ func (pr *ProgressReader) notifyIfNeeded() {
 }
 
 func FormatBytes(bytes int64) string {
+	if bytes <= 0 {
+		return "0 B"
+	}
 	const unit = 1024
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
@@ -71,4 +75,22 @@ func FormatBytes(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func RenderProgressBar(read, total int64, width int) string {
+	if total <= 0 {
+		return "[░░░░░░░░░░] 0%"
+	}
+	pct := float64(read) / float64(total)
+	if pct > 1.0 {
+		pct = 1.0
+	}
+	filledLen := int(pct * float64(width))
+	if filledLen < 0 {
+		filledLen = 0
+	}
+	emptyLen := width - filledLen
+
+	bar := strings.Repeat("█", filledLen) + strings.Repeat("░", emptyLen)
+	return fmt.Sprintf("[%s] %d%%", bar, int(pct*100))
 }

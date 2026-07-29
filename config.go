@@ -8,16 +8,17 @@ import (
 )
 
 type Config struct {
-	AppID          int     `json:"app_id"`
-	AppHash        string  `json:"app_hash"`
-	BotToken       string  `json:"bot_token,omitempty"`
-	PhoneNumber    string  `json:"phone_number,omitempty"`
-	SessionFile    string  `json:"session_file"`
-	GDriveSAFile   string  `json:"gdrive_sa_file"`
-	GDriveFolderID string  `json:"gdrive_folder_id"`
-	OwnerID        int64   `json:"owner_id"`
-	AllowedUsers   []int64 `json:"allowed_users"`
-	MaxConcurrency int     `json:"max_concurrency"`
+	AppID              int     `json:"app_id"`
+	AppHash            string  `json:"app_hash"`
+	BotToken           string  `json:"bot_token,omitempty"`
+	PhoneNumber        string  `json:"phone_number,omitempty"`
+	SessionFile        string  `json:"session_file"`
+	GDriveSAFile       string  `json:"gdrive_sa_file"`
+	GDriveFolderID     string  `json:"gdrive_folder_id"`
+	OwnerID            int64   `json:"owner_id"`
+	AllowedUsers       []int64 `json:"allowed_users"`
+	MaxConcurrency     int     `json:"max_concurrency"`
+	StatusRefreshDelay int     `json:"status_refresh_delay_sec"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -26,7 +27,6 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("config file stat error: %w", err)
 	}
 
-	// Perms check: warn/reject if world readable
 	if info.Mode().Perm()&0004 != 0 {
 		fmt.Fprintf(os.Stderr, "WARNING: Config file %s is world-readable! Setting 0600 permissions.\n", path)
 		_ = os.Chmod(path, 0600)
@@ -70,6 +70,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxConcurrency <= 0 {
 		c.MaxConcurrency = 3
+	}
+	if c.StatusRefreshDelay <= 0 {
+		c.StatusRefreshDelay = 5
 	}
 	return nil
 }

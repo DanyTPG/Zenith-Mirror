@@ -3,45 +3,54 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestJobManagerConcurrencyAndCancel(t *testing.T) {
 	jm := NewJobManager(2)
+	ctx := context.Background()
 
-	j1, err := jm.CreateJob(context.Background(), JobTypeMirror, "file1.txt", 100, 1001)
+	executed := make(chan string, 10)
+
+	j1, err := jm.CreateJob(ctx, JobTypeMirror, "file1.bin", 1000, 1001, func() { executed <- "j1" })
 	if err != nil {
-		t.Fatalf("failed creating job 1: %v", err)
+		t.Fatalf("failed creating j1: %v", err)
 	}
 
-	j2, err := jm.CreateJob(context.Background(), JobTypeLeech, "file2.txt", 200, 1001)
+	j2, err := jm.CreateJob(ctx, JobTypeMirror, "file2.bin", 2000, 1001, func() { executed <- "j2" })
 	if err != nil {
-		t.Fatalf("failed creating job 2: %v", err)
+		t.Fatalf("failed creating j2: %v", err)
 	}
 
-	_, err = jm.CreateJob(context.Background(), JobTypeMirror, "file3.txt", 300, 1001)
-	if err == nil {
-		t.Fatalf("expected concurrency error on 3rd job")
+	// 3rd job should be queued because max_concurrency = 2
+	j3, err := jm.CreateJob(ctx, JobTypeMirror, "file3.bin", 3000, 1001, func() { executed <- "j3" })
+	if err != nil {
+		t.Fatalf("failed creating j3: %v", err)
 	}
 
-	if len(jm.GetActiveJobs()) != 2 {
-		t.Errorf("expected 2 active jobs")
+	if j1.State != StateRunning || j2.State != StateRunning {
+		t.Errorf("j1 and j2 should be running")
 	}
 
-	if !jm.CancelJob(j1.ID) {
-		t.Errorf("failed to cancel job 1")
+	if j3.State != StateQueued {
+		t.Errorf("j3 should be queued, got %s", j3.State)
 	}
 
+	// Finish j1 -> j3 should be dequeued and executed
 	jm.FinishJob(j1.ID)
 
-	j3, err := jm.CreateJob(context.Background(), JobTypeMirror, "file3.txt", 300, 1001)
-	if err != nil {
-		t.Fatalf("failed creating job 3 after slot freed: %v", err)
+	select {
+	case id := <-executed:
+		if id != "j3" {
+			t.Errorf("expected j3 execution, got %s", id)
+		}
+	case <-time.After(1 * time.Second):
+		t.Errorf("j3 was not executed after j1 finished")
 	}
 
-	jm.FinishJob(j2.ID)
-	jm.FinishJob(j3.ID)
-
-	if len(jm.GetActiveJobs()) != 0 {
-		t.Errorf("expected 0 jobs remaining")
+	// Test CancelAll
+	count := jm.CancelAllJobs()
+	if count < 1 {
+		t.Errorf("expected at least 1 job cancelled, got %d", count)
 	}
 }

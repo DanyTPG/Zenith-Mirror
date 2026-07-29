@@ -155,6 +155,8 @@ func (ts *TelegramService) registerRoutes() {
 			return ts.handleStats(ctx, entities, update)
 		} else if text == "/restart" {
 			return ts.handleRestart(ctx, entities, update)
+		} else if text == "/cancel-all" {
+			return ts.handleCancelAll(ctx, entities, update)
 		} else if strings.HasPrefix(text, "/cancel") {
 			return ts.handleCancel(ctx, entities, update, msg, text)
 		} else if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m") {
@@ -175,9 +177,10 @@ func (ts *TelegramService) handleStart(ctx context.Context, entities tg.Entities
 		styling.Plain("\n"),
 		styling.Plain("• `/mirror` or `/m [-i count]` (Reply to media to upload to Google Drive)\n"),
 		styling.Plain("• `/leech <url>` (Download direct link to Telegram)\n"),
-		styling.Plain("• `/status` (Check active jobs)\n"),
+		styling.Plain("• `/status` (Check active jobs & queue)\n"),
 		styling.Plain("• `/stats` (View system & bot statistics)\n"),
-		styling.Plain("• `/cancel <job_id>` (Cancel transfer)\n"),
+		styling.Plain("• `/cancel <job_id>` (Cancel specific transfer)\n"),
+		styling.Plain("• `/cancel-all` (Cancel all transfers and flush queue)\n"),
 		styling.Plain("• `/restart` (Restart bot service)"),
 	}
 	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
@@ -301,6 +304,16 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	var options []styling.StyledTextOption
 
 	for i, j := range jobs {
+		if j.State == StateQueued {
+			options = append(options, styling.Bold(fmt.Sprintf("%d.Queued:", i+1)))
+			options = append(options, styling.Plain(" "))
+			options = append(options, styling.Code(j.FileName))
+			options = append(options, styling.Plain(fmt.Sprintf("\nSize: %s | Status: Waiting in Queue\n", FormatBytes(j.Size))))
+			options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
+			options = append(options, styling.Plain("\n\n"))
+			continue
+		}
+
 		bar := RenderProgressBar(j.ReadBytes, j.Size, 12)
 		pct := 0.0
 		if j.Size > 0 {
@@ -446,6 +459,12 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	return err
 }
 
+func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	count := ts.jm.CancelAllJobs()
+	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled all %d active and queued jobs.", count))
+	return err
+}
+
 func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
 	if msg.ReplyTo == nil {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror or /m [-i count] to upload to Google Drive.")
@@ -506,15 +525,20 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			continue
 		}
 
-		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID)
+		var jobRef *Job
+		execFunc := func() {
+			ts.executeMirrorJob(jobRef, location, entities, update)
+		}
+
+		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID, execFunc)
 		if err != nil {
 			slog.Warn("could not create mirror job", "msg_id", targetID, "error", err)
 			continue
 		}
+		jobRef = job
 
 		queuedJobs++
 		go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
-		go ts.executeMirrorJob(job, location, entities, update)
 	}
 
 	if queuedJobs == 0 {
@@ -626,17 +650,22 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	}
 	rawURL := parts[1]
 
-	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, rawURL, 0, userID)
+	var jobRef *Job
+	execFunc := func() {
+		ts.executeLeechJob(jobRef, rawURL, entities, update)
+	}
+
+	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, rawURL, 0, userID, execFunc)
 	if err != nil {
 		slog.Error("failed creating leech job", "error", err)
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 		return replyErr
 	}
+	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
 
 	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
-	go ts.executeLeechJob(job, rawURL, entities, update)
 
 	return nil
 }

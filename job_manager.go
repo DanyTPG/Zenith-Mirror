@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -23,28 +21,38 @@ const (
 	PhaseUploading   JobPhase = "Uploading"
 )
 
+type JobState string
+
+const (
+	StateQueued    JobState = "QUEUED"
+	StateRunning   JobState = "RUNNING"
+	StateCancelled JobState = "CANCELLED"
+	StateCompleted JobState = "COMPLETED"
+)
+
 type Job struct {
 	ID        string
 	Type      JobType
 	FileName  string
 	Size      int64
-	Phase     JobPhase
 	ReadBytes int64
 	Speed     float64
 	ETA       time.Duration
+	Phase     JobPhase
+	State     JobState
 	Status    string
 	UserID    int64
 	Ctx       context.Context
 	Cancel    context.CancelFunc
-	StartTime time.Time
+	Execute   func()
 }
 
 type JobManager struct {
-	mu             sync.RWMutex
-	jobs           map[string]*Job
+	mu             sync.Mutex
+	active         map[string]*Job
+	queue          []*Job
 	maxConcurrency int
-	semaphore      chan struct{}
-	seq            uint64
+	jobCounter     uint64
 }
 
 func NewJobManager(maxConcurrency int) *JobManager {
@@ -52,71 +60,154 @@ func NewJobManager(maxConcurrency int) *JobManager {
 		maxConcurrency = 3
 	}
 	return &JobManager{
-		jobs:           make(map[string]*Job),
+		active:         make(map[string]*Job),
+		queue:          make([]*Job, 0),
 		maxConcurrency: maxConcurrency,
-		semaphore:      make(chan struct{}, maxConcurrency),
 	}
 }
 
-func (jm *JobManager) CreateJob(parentCtx context.Context, jobType JobType, name string, size int64, userID int64) (*Job, error) {
-	select {
-	case jm.semaphore <- struct{}{}:
-	default:
-		return nil, errors.New("max concurrent jobs reached, please try again later")
-	}
+func (jm *JobManager) CreateJob(ctx context.Context, jobType JobType, fileName string, size int64, userID int64, execute func()) (*Job, error) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
 
-	idNum := atomic.AddUint64(&jm.seq, 1)
-	jobID := fmt.Sprintf("job-%d", idNum)
+	jm.jobCounter++
+	id := fmt.Sprintf("job-%d", jm.jobCounter)
 
-	ctx, cancel := context.WithCancel(parentCtx)
+	jobCtx, cancel := context.WithCancel(ctx)
 
 	job := &Job{
-		ID:        jobID,
+		ID:        id,
 		Type:      jobType,
-		FileName:  name,
+		FileName:  fileName,
 		Size:      size,
 		Phase:     PhaseDownloading,
-		Status:    "Starting",
+		State:     StateQueued,
+		Status:    "Queued",
 		UserID:    userID,
-		Ctx:       ctx,
+		Ctx:       jobCtx,
 		Cancel:    cancel,
-		StartTime: time.Now(),
+		Execute:   execute,
 	}
 
-	jm.mu.Lock()
-	jm.jobs[jobID] = job
-	jm.mu.Unlock()
+	jm.active[id] = job
+
+	runningCount := 0
+	for _, j := range jm.active {
+		if j.State == StateRunning {
+			runningCount++
+		}
+	}
+
+	if runningCount < jm.maxConcurrency {
+		job.State = StateRunning
+		job.Status = "Running"
+		go job.Execute()
+	} else {
+		jm.queue = append(jm.queue, job)
+	}
 
 	return job, nil
 }
 
-func (jm *JobManager) FinishJob(jobID string) {
-	jm.mu.Lock()
-	if job, ok := jm.jobs[jobID]; ok {
-		job.Cancel()
-		delete(jm.jobs, jobID)
-		<-jm.semaphore
-	}
-	jm.mu.Unlock()
-}
-
-func (jm *JobManager) CancelJob(jobID string) bool {
+func (jm *JobManager) FinishJob(id string) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
-	job, ok := jm.jobs[jobID]
+
+	if job, ok := jm.active[id]; ok {
+		job.State = StateCompleted
+		delete(jm.active, id)
+	}
+
+	for i, qJob := range jm.queue {
+		if qJob.ID == id {
+			jm.queue = append(jm.queue[:i], jm.queue[i+1:]...)
+			break
+		}
+	}
+
+	runningCount := 0
+	for _, j := range jm.active {
+		if j.State == StateRunning {
+			runningCount++
+		}
+	}
+
+	if runningCount < jm.maxConcurrency && len(jm.queue) > 0 {
+		nextJob := jm.queue[0]
+		jm.queue = jm.queue[1:]
+		nextJob.State = StateRunning
+		nextJob.Status = "Running"
+		go nextJob.Execute()
+	}
+}
+
+func (jm *JobManager) CancelJob(id string) bool {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	job, ok := jm.active[id]
 	if !ok {
 		return false
 	}
+
+	job.State = StateCancelled
+	job.Status = "Cancelled"
 	job.Cancel()
+	delete(jm.active, id)
+
+	for i, qJob := range jm.queue {
+		if qJob.ID == id {
+			jm.queue = append(jm.queue[:i], jm.queue[i+1:]...)
+			break
+		}
+	}
+
+	runningCount := 0
+	for _, j := range jm.active {
+		if j.State == StateRunning {
+			runningCount++
+		}
+	}
+	if runningCount < jm.maxConcurrency && len(jm.queue) > 0 {
+		nextJob := jm.queue[0]
+		jm.queue = jm.queue[1:]
+		nextJob.State = StateRunning
+		nextJob.Status = "Running"
+		go nextJob.Execute()
+	}
+
 	return true
 }
 
-func (jm *JobManager) GetActiveJobs() []*Job {
-	jm.mu.RLock()
-	defer jm.mu.RUnlock()
-	list := make([]*Job, 0, len(jm.jobs))
-	for _, j := range jm.jobs {
-		list = append(list, j)
+func (jm *JobManager) CancelAllJobs() int {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	count := len(jm.active)
+	for _, job := range jm.active {
+		job.State = StateCancelled
+		job.Status = "Cancelled"
+		job.Cancel()
 	}
-	return list
+
+	jm.active = make(map[string]*Job)
+	jm.queue = make([]*Job, 0)
+	return count
+}
+
+func (jm *JobManager) GetActiveJobs() []*Job {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	jobs := make([]*Job, 0, len(jm.active))
+	for _, j := range jm.active {
+		jobs = append(jobs, j)
+	}
+	return jobs
+}
+
+func (jm *JobManager) GetActiveJobCount() int {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	return len(jm.active)
 }

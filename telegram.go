@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/session"
@@ -658,6 +659,54 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 	return ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 }
 
+// progressWriterAt wraps an io.WriterAt to track total bytes written (for parallel downloads)
+type progressWriterAt struct {
+	dest       io.WriterAt
+	totalBytes int64
+	written    int64
+	startTime  time.Time
+	onProgress func(read, total int64, speed float64, eta time.Duration)
+	lastNotify time.Time
+	mu         sync.Mutex
+}
+
+func newProgressWriterAt(dest io.WriterAt, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *progressWriterAt {
+	return &progressWriterAt{
+		dest:       dest,
+		totalBytes: totalBytes,
+		startTime:  time.Now(),
+		onProgress: onProgress,
+	}
+}
+
+func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := pw.dest.WriteAt(p, off)
+	if n > 0 {
+		pw.mu.Lock()
+		pw.written += int64(n)
+		written := pw.written
+		now := time.Now()
+		shouldNotify := now.Sub(pw.lastNotify) >= 1*time.Second
+		if shouldNotify {
+			pw.lastNotify = now
+		}
+		pw.mu.Unlock()
+
+		if shouldNotify && pw.onProgress != nil {
+			elapsed := now.Sub(pw.startTime).Seconds()
+			if elapsed > 0 {
+				speed := float64(written) / elapsed
+				var eta time.Duration
+				if speed > 0 && pw.totalBytes > written {
+					eta = time.Duration(float64(pw.totalBytes-written)/speed) * time.Second
+				}
+				pw.onProgress(written, pw.totalBytes, speed, eta)
+			}
+		}
+	}
+	return n, err
+}
+
 // executeMirrorParallel: multi-threaded download to temp file, then stream to GDrive
 func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFileLocationClass) (string, error) {
 	tmpFile, err := os.CreateTemp("", "zenith-dl-*")
@@ -669,10 +718,17 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 
 	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", ts.cfg.DownloadThreads, "tmp", tmpFile.Name())
 
+	// Wrap temp file to track download progress
+	pwa := newProgressWriterAt(tmpFile, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
+
 	// Parallel download to temp file with N threads
 	_, err = ts.downloader.Download(ts.client.API(), location).
 		WithThreads(ts.cfg.DownloadThreads).
-		Parallel(job.Ctx, tmpFile)
+		Parallel(job.Ctx, pwa)
 	if err != nil {
 		return "", fmt.Errorf("parallel download failed: %w", err)
 	}
@@ -685,7 +741,9 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		return "", fmt.Errorf("failed to seek temp file: %w", err)
 	}
 
-	job.ReadBytes = downloadedSize
+	job.ReadBytes = 0
+	job.Speed = 0
+	job.ETA = 0
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Google Drive"
 

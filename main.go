@@ -30,7 +30,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	gdrive, err := NewGDriveService(ctx, cfg.GDriveSAFile, cfg.GDriveFolderID)
+	gdrive, err := NewGDriveService(ctx, cfg)
 	if err != nil {
 		slog.Error("failed to initialize gdrive service", "error", err)
 		os.Exit(1)

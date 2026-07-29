@@ -13,7 +13,9 @@ type Config struct {
 	BotToken           string  `json:"bot_token,omitempty"`
 	PhoneNumber        string  `json:"phone_number,omitempty"`
 	SessionFile        string  `json:"session_file"`
-	GDriveSAFile       string  `json:"gdrive_sa_file"`
+	GDriveSAFile       string  `json:"gdrive_sa_file,omitempty"`
+	GDriveCredentials  string  `json:"gdrive_credentials_file,omitempty"`
+	GDriveTokenFile    string  `json:"gdrive_token_file,omitempty"`
 	GDriveFolderID     string  `json:"gdrive_folder_id"`
 	OwnerID            int64   `json:"owner_id"`
 	AllowedUsers       []int64 `json:"allowed_users"`
@@ -56,8 +58,8 @@ func (c *Config) Validate() error {
 	if c.AppHash == "" {
 		return errors.New("app_hash is required")
 	}
-	if c.GDriveSAFile == "" {
-		return errors.New("gdrive_sa_file is required")
+	if c.GDriveSAFile == "" && c.GDriveCredentials == "" {
+		return errors.New("either gdrive_sa_file or gdrive_credentials_file is required")
 	}
 	if c.GDriveFolderID == "" {
 		return errors.New("gdrive_folder_id is required")
@@ -67,6 +69,9 @@ func (c *Config) Validate() error {
 	}
 	if c.SessionFile == "" {
 		c.SessionFile = "session.json"
+	}
+	if c.GDriveTokenFile == "" {
+		c.GDriveTokenFile = "gdrive_token.json"
 	}
 	if c.MaxConcurrency <= 0 {
 		c.MaxConcurrency = 3

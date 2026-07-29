@@ -61,36 +61,36 @@ func (pr *ProgressReader) notifyIfNeeded() {
 	pr.onProgress(read, pr.totalBytes, speed, eta)
 }
 
-func FormatBytes(bytes int64) string {
-	if bytes <= 0 {
-		return "0 B"
+func RenderProgressBar(current, total int64, length int) string {
+	if length <= 0 {
+		length = 12
 	}
+	if total <= 0 {
+		return "[" + strings.Repeat("□", length) + "]"
+	}
+
+	percent := float64(current) / float64(total)
+	if percent > 1.0 {
+		percent = 1.0
+	}
+	if percent < 0 {
+		percent = 0
+	}
+
+	filledLength := int(percent * float64(length))
+	bar := strings.Repeat("■", filledLength) + strings.Repeat("□", length-filledLength)
+	return "[" + bar + "]"
+}
+
+func FormatBytes(b int64) string {
 	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
 	}
 	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
+	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func RenderProgressBar(read, total int64, width int) string {
-	if total <= 0 {
-		return "[░░░░░░░░░░] 0%"
-	}
-	pct := float64(read) / float64(total)
-	if pct > 1.0 {
-		pct = 1.0
-	}
-	filledLen := int(pct * float64(width))
-	if filledLen < 0 {
-		filledLen = 0
-	}
-	emptyLen := width - filledLen
-
-	bar := strings.Repeat("█", filledLen) + strings.Repeat("░", emptyLen)
-	return fmt.Sprintf("[%s] %d%%", bar, int(pct*100))
+	return fmt.Sprintf("%.2f%cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

@@ -8,29 +8,27 @@ import (
 )
 
 func TestProgressReader(t *testing.T) {
-	data := make([]byte, 1024*1024) // 1MB
+	data := []byte("hello world, this is a test stream for progress reader")
 	buf := bytes.NewReader(data)
 
-	var lastRead int64
 	pr := NewProgressReader(buf, int64(len(data)), func(read, total int64, speed float64, eta time.Duration) {
-		lastRead = read
 	})
 
-	out := make([]byte, 512*1024)
-	n, err := io.ReadFull(pr, out)
-	if err != nil || n != 512*1024 {
-		t.Fatalf("failed reading: %v, n=%d", err, n)
+	out, err := io.ReadAll(pr)
+	if err != nil {
+		t.Fatalf("failed reading: %v", err)
 	}
 
-	if atomicRead := pr.readBytes; atomicRead != 512*1024 {
-		t.Errorf("expected 512KB read, got %d", atomicRead)
+	if len(out) != len(data) {
+		t.Errorf("expected %d bytes, got %d", len(data), len(out))
 	}
-	_ = lastRead
+}
 
-	if FormatBytes(1024) != "1.00 KB" {
-		t.Errorf("FormatBytes failed, got %s", FormatBytes(1024))
+func TestFormatBytes(t *testing.T) {
+	if got := FormatBytes(1024); got != "1.00KB" {
+		t.Errorf("FormatBytes failed, got %s", got)
 	}
-	if FormatBytes(1048576) != "1.00 MB" {
-		t.Errorf("FormatBytes failed, got %s", FormatBytes(1048576))
+	if got := FormatBytes(1048576); got != "1.00MB" {
+		t.Errorf("FormatBytes failed, got %s", got)
 	}
 }

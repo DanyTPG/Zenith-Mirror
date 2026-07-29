@@ -285,16 +285,55 @@ func (ts *TelegramService) buildStatusText() string {
 		return "No active transfer jobs."
 	}
 
-	statusText := "Zenith-Mirror Active Transfers:\n\n"
-	for _, j := range jobs {
-		bar := RenderProgressBar(j.ReadBytes, j.Size, 10)
+	statusText := ""
+	for i, j := range jobs {
+		bar := RenderProgressBar(j.ReadBytes, j.Size, 12)
+		pct := 0.0
+		if j.Size > 0 {
+			pct = (float64(j.ReadBytes) / float64(j.Size)) * 100
+		}
+
 		etaStr := "N/A"
 		if j.ETA > 0 {
-			etaStr = j.ETA.Round(time.Second).String()
+			etaStr = formatDuration(j.ETA)
 		}
-		statusText += fmt.Sprintf("• %s [%s]\n  File: %s\n  Phase: [%s] %s\n  Size: %s / %s | Speed: %s/s | ETA: %s\n  Status: %s\n\n",
-			j.ID, j.Type, j.FileName, j.Phase, bar, FormatBytes(j.ReadBytes), FormatBytes(j.Size), FormatBytes(int64(j.Speed)), etaStr, j.Status)
+
+		phaseName := "Download"
+		if j.Phase == PhaseUploading {
+			phaseName = "Upload"
+		}
+
+		statusText += fmt.Sprintf("%d.%s: %s\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n/cancel %s\n\n",
+			i+1, phaseName, j.FileName,
+			bar, pct,
+			FormatBytes(j.ReadBytes), FormatBytes(j.Size),
+			FormatBytes(int64(j.Speed)), etaStr,
+			j.ID)
 	}
+
+	cpuPercent := 0.0
+	if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
+		cpuPercent = percents[0]
+	}
+
+	freeDisk := "N/A"
+	if d, err := disk.Usage("/"); err == nil {
+		freeDisk = FormatBytes(int64(d.Free))
+	}
+
+	memPercent := 0.0
+	if v, err := mem.VirtualMemory(); err == nil {
+		memPercent = v.UsedPercent
+	}
+
+	osUptimeStr := "N/A"
+	if hostInfo, err := host.Info(); err == nil {
+		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
+	}
+
+	statusText += fmt.Sprintf("CPU: %.1f%% | FREE: %s\nRAM: %.1f%% | UPTIME: %s",
+		cpuPercent, freeDisk, memPercent, osUptimeStr)
+
 	return statusText
 }
 

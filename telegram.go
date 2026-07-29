@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -16,6 +18,11 @@ import (
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/mem"
+	netstat "github.com/shirou/gopsutil/v3/net"
 )
 
 type TelegramService struct {
@@ -27,6 +34,7 @@ type TelegramService struct {
 	gdrive     *GDriveService
 	jm         *JobManager
 	dispatcher *tg.UpdateDispatcher
+	startTime  time.Time
 }
 
 type ProgressWriter struct {
@@ -109,6 +117,7 @@ func NewTelegramService(cfg *Config, jm *JobManager, gdrive *GDriveService) (*Te
 		gdrive:     gdrive,
 		jm:         jm,
 		dispatcher: &dispatcher,
+		startTime:  time.Now(),
 	}
 
 	ts.registerRoutes()
@@ -136,11 +145,17 @@ func (ts *TelegramService) registerRoutes() {
 		}
 
 		text := strings.TrimSpace(msg.Message)
-		if strings.HasPrefix(text, "/status") {
+		if text == "/start" {
+			return ts.handleStart(ctx, entities, update)
+		} else if strings.HasPrefix(text, "/status") {
 			return ts.handleStatus(ctx, entities, update, msg)
+		} else if text == "/stats" {
+			return ts.handleStats(ctx, entities, update)
+		} else if text == "/restart" {
+			return ts.handleRestart(ctx, entities, update)
 		} else if strings.HasPrefix(text, "/cancel") {
 			return ts.handleCancel(ctx, entities, update, msg, text)
-		} else if strings.HasPrefix(text, "/mirror") {
+		} else if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m") {
 			return ts.handleMirror(ctx, entities, update, msg, senderID)
 		} else if strings.HasPrefix(text, "/leech") {
 			return ts.handleLeech(ctx, entities, update, msg, text, senderID)
@@ -148,6 +163,114 @@ func (ts *TelegramService) registerRoutes() {
 
 		return nil
 	})
+}
+
+func (ts *TelegramService) handleStart(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	welcomeMsg := "⚡ *Zenith-Mirror Bot*\n\n" +
+		"Available Commands:\n" +
+		"• `/mirror` or `/m` (Reply to media to upload to Google Drive)\n" +
+		"• `/leech <url>` (Download direct link to Telegram)\n" +
+		"• `/status` (Check active jobs)\n" +
+		"• `/stats` (View system & bot statistics)\n" +
+		"• `/cancel <job_id>` (Cancel transfer)\n" +
+		"• `/restart` (Restart bot service)"
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(welcomeMsg))
+	return err
+}
+
+func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	_, _ = ts.sender.Reply(entities, update).Text(ctx, "🔄 Restarting Zenith-Mirror...")
+	go func() {
+		time.Sleep(1 * time.Second)
+		slog.Info("restarting process via /restart command")
+		os.Exit(0)
+	}()
+	return nil
+}
+
+func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	botUptime := formatDuration(time.Since(ts.startTime))
+
+	osUptimeStr := "N/A"
+	if hostInfo, err := host.Info(); err == nil {
+		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
+	}
+
+	totalDisk, usedDisk, freeDisk, diskPercent := "N/A", "N/A", "N/A", 0.0
+	if d, err := disk.Usage("/"); err == nil {
+		totalDisk = FormatBytes(int64(d.Total))
+		usedDisk = FormatBytes(int64(d.Used))
+		freeDisk = FormatBytes(int64(d.Free))
+		diskPercent = d.UsedPercent
+	}
+
+	netSent, netRecv := "N/A", "N/A"
+	if ioCounters, err := netstat.IOCounters(false); err == nil && len(ioCounters) > 0 {
+		netSent = FormatBytes(int64(ioCounters[0].BytesSent))
+		netRecv = FormatBytes(int64(ioCounters[0].BytesRecv))
+	}
+
+	cpuPercent := 0.0
+	if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
+		cpuPercent = percents[0]
+	}
+
+	physCores := runtime.NumCPU()
+	totalCores := runtime.NumCPU()
+	if counts, err := cpu.Counts(false); err == nil && counts > 0 {
+		physCores = counts
+	}
+	if counts, err := cpu.Counts(true); err == nil && counts > 0 {
+		totalCores = counts
+	}
+
+	memTotal, memFree, memUsed, memPercent := "N/A", "N/A", "N/A", 0.0
+	swapTotal, swapUsed, swapPercent := "N/A", "N/A", 0.0
+	if v, err := mem.VirtualMemory(); err == nil {
+		memTotal = FormatBytes(int64(v.Total))
+		memFree = FormatBytes(int64(v.Free))
+		memUsed = FormatBytes(int64(v.Used))
+		memPercent = v.UsedPercent
+	}
+	if s, err := mem.SwapMemory(); err == nil {
+		swapTotal = FormatBytes(int64(s.Total))
+		swapUsed = FormatBytes(int64(s.Used))
+		swapPercent = s.UsedPercent
+	}
+
+	statsText := fmt.Sprintf("Bot Uptime: %s\nOS Uptime: %s\n\n"+
+		"Total Disk Space: %s\nUsed: %s | Free: %s\n\n"+
+		"Upload: %s\nDownload: %s\n\n"+
+		"CPU: %.1f%%\nRAM: %.1f%%\nDISK: %.1f%%\n\n"+
+		"Physical Cores: %d\nTotal Cores: %d\n\n"+
+		"SWAP: %s (%s) | Used: %.1f%%\nMemory Total: %s\nMemory Free: %s\nMemory Used: %s",
+		botUptime, osUptimeStr,
+		totalDisk, usedDisk, freeDisk,
+		netSent, netRecv,
+		cpuPercent, memPercent, diskPercent,
+		physCores, totalCores,
+		swapTotal, swapUsed, swapPercent, memTotal, memFree, memUsed)
+
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(statsText))
+	return err
+}
+
+func formatDuration(d time.Duration) string {
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd%dh%dm%ds", days, hours, minutes, seconds)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
@@ -264,7 +387,7 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 
 func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, userID int64) error {
 	if msg.ReplyTo == nil {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror to upload it to Google Drive.")
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror (or /m) to upload it to Google Drive.")
 		return err
 	}
 

@@ -29,6 +29,59 @@ type TelegramService struct {
 	dispatcher *tg.UpdateDispatcher
 }
 
+type ProgressWriter struct {
+	writer     io.Writer
+	totalBytes int64
+	readBytes  int64
+	startTime  time.Time
+	onProgress func(read, total int64, speed float64, eta time.Duration)
+	lastNotify time.Time
+}
+
+func NewProgressWriter(w io.Writer, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *ProgressWriter {
+	return &ProgressWriter{
+		writer:     w,
+		totalBytes: totalBytes,
+		startTime:  time.Now(),
+		onProgress: onProgress,
+	}
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n, err := pw.writer.Write(p)
+	if n > 0 {
+		pw.readBytes += int64(n)
+		pw.notifyIfNeeded()
+	}
+	return n, err
+}
+
+func (pw *ProgressWriter) notifyIfNeeded() {
+	if pw.onProgress == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(pw.lastNotify) < 1*time.Second {
+		return
+	}
+	pw.lastNotify = now
+
+	read := pw.readBytes
+	elapsed := now.Sub(pw.startTime).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+
+	speed := float64(read) / elapsed
+	var eta time.Duration
+	if speed > 0 && pw.totalBytes > read {
+		remainingBytes := pw.totalBytes - read
+		eta = time.Duration(float64(remainingBytes)/speed) * time.Second
+	}
+
+	pw.onProgress(read, pw.totalBytes, speed, eta)
+}
+
 func NewTelegramService(cfg *Config, jm *JobManager, gdrive *GDriveService) (*TelegramService, error) {
 	storage := &session.FileStorage{
 		Path: cfg.SessionFile,
@@ -122,7 +175,7 @@ func (ts *TelegramService) buildStatusText() string {
 	return statusText
 }
 
-func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) {
+func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) {
 	delay := ts.cfg.StatusRefreshDelay
 	if delay <= 0 {
 		delay = 5
@@ -155,6 +208,7 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 		select {
 		case <-jobCtx.Done():
 			if statusMsgID > 0 {
+				slog.Info("deleting completed job live status message", "status_msg_id", statusMsgID)
 				_, _ = ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
 					Revoke: true,
 					ID:     []int{statusMsgID},
@@ -240,7 +294,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return replyErr
 	}
 
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update)
+	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
 	go ts.executeMirrorJob(job, location, entities, update)
 
 	return nil
@@ -288,12 +342,11 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size)
 	job.Phase = PhaseDownloading
-	job.Status = "Downloading from Telegram"
+	job.Status = "Streaming from Telegram to Google Drive"
 
 	pr, pw := io.Pipe()
 
-	// Wrap pipe reader in progress tracking for downloading phase
-	downloadProgressReader := NewProgressReader(pr, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+	progressWriter := NewProgressWriter(pw, job.Size, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
 		job.Speed = speed
 		job.ETA = eta
@@ -302,19 +355,17 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	go func() {
 		defer pw.Close()
 		slog.Info("starting telegram media stream download", "job_id", job.ID)
-		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, pw)
+		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, progressWriter)
 		if err != nil {
 			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
 		} else {
 			slog.Info("telegram media download stream finished", "job_id", job.ID, "bytes_written", written)
+			job.Phase = PhaseUploading
+			job.Status = "Finalizing Google Drive Upload"
 		}
 	}()
 
-	// Switch phase to Uploading when GDrive uploader starts consuming bytes
-	job.Phase = PhaseUploading
-	job.Status = "Streaming to Google Drive"
-
-	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, downloadProgressReader, job.Size)
+	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 	if err != nil {
 		slog.Error("gdrive upload failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
@@ -343,7 +394,7 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
 
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update)
+	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
 	go ts.executeLeechJob(job, rawURL, entities, update)
 
 	return nil

@@ -16,6 +16,8 @@ type Config struct {
 	GDriveTokenFile        string  `json:"gdrive_token_file"`
 	GDriveFolderID         string  `json:"gdrive_folder_id"`
 	IndexBaseURL           string  `json:"index_base_url"`
+	DownloadMode           string  `json:"download_mode"`    // "stream" (zero-disk) or "parallel" (temp file, faster)
+	DownloadThreads        int     `json:"download_threads"` // threads for parallel mode (default 4)
 	OwnerID                int64   `json:"owner_id"`
 	AllowedUserIDs         []int64 `json:"allowed_user_ids"`
 	MaxConcurrency         int     `json:"max_concurrency"`
@@ -60,6 +62,12 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 3
+	}
+	if cfg.DownloadMode == "" {
+		cfg.DownloadMode = "stream"
+	}
+	if cfg.DownloadThreads <= 0 {
+		cfg.DownloadThreads = 4
 	}
 	cfg.StatusRefreshDelay = cfg.StatusRefreshDelaySec
 	if cfg.StatusRefreshDelay <= 0 {

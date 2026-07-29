@@ -591,34 +591,21 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
 	defer ts.jm.FinishJob(job.ID)
 
-	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size)
+	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size, "mode", ts.cfg.DownloadMode)
 	job.Phase = PhaseDownloading
 	job.Status = "Streaming from Telegram to Google Drive"
 
-	pr, pw := io.Pipe()
+	var driveURL string
+	var err error
 
-	progressWriter := NewProgressWriter(pw, job.Size, func(read, total int64, speed float64, eta time.Duration) {
-		job.ReadBytes = read
-		job.Speed = speed
-		job.ETA = eta
-	})
+	if ts.cfg.DownloadMode == "parallel" {
+		driveURL, err = ts.executeMirrorParallel(job, location)
+	} else {
+		driveURL, err = ts.executeMirrorStream(job, location)
+	}
 
-	go func() {
-		defer pw.Close()
-		slog.Info("starting telegram media stream download", "job_id", job.ID)
-		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, progressWriter)
-		if err != nil {
-			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
-		} else {
-			slog.Info("telegram media download stream finished", "job_id", job.ID, "bytes_written", written)
-			job.Phase = PhaseUploading
-			job.Status = "Finalizing Google Drive Upload"
-		}
-	}()
-
-	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 	if err != nil {
-		slog.Error("gdrive upload failed", "job_id", job.ID, "error", err)
+		slog.Error("mirror job failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
 		return
 	}
@@ -642,6 +629,74 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	}
 
 	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
+}
+
+// executeMirrorStream: zero-disk pipe streaming (download + upload simultaneously)
+func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLocationClass) (string, error) {
+	pr, pw := io.Pipe()
+
+	progressWriter := NewProgressWriter(pw, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
+
+	go func() {
+		defer pw.Close()
+		slog.Info("starting telegram media stream download", "job_id", job.ID)
+		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, progressWriter)
+		if err != nil {
+			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
+			pw.CloseWithError(err)
+		} else {
+			slog.Info("telegram media download stream finished", "job_id", job.ID, "bytes_written", written)
+			job.Phase = PhaseUploading
+			job.Status = "Uploading to Google Drive"
+		}
+	}()
+
+	return ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
+}
+
+// executeMirrorParallel: multi-threaded download to temp file, then stream to GDrive
+func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFileLocationClass) (string, error) {
+	tmpFile, err := os.CreateTemp("", "zenith-dl-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", ts.cfg.DownloadThreads, "tmp", tmpFile.Name())
+
+	// Parallel download to temp file with N threads
+	_, err = ts.downloader.Download(ts.client.API(), location).
+		WithThreads(ts.cfg.DownloadThreads).
+		Parallel(job.Ctx, tmpFile)
+	if err != nil {
+		return "", fmt.Errorf("parallel download failed: %w", err)
+	}
+
+	downloadedSize, _ := tmpFile.Seek(0, io.SeekEnd)
+	slog.Info("parallel download finished", "job_id", job.ID, "bytes", downloadedSize)
+
+	// Seek back to start for upload
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	job.ReadBytes = downloadedSize
+	job.Phase = PhaseUploading
+	job.Status = "Uploading to Google Drive"
+
+	// Stream temp file into GDrive with progress tracking
+	progressReader := NewProgressReader(tmpFile, downloadedSize, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
+
+	return ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, downloadedSize)
 }
 
 func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {

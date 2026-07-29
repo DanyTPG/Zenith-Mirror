@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -579,11 +580,21 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	job.Status = "Completed"
 	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
 
+	baseURL := ts.cfg.IndexBaseURL
+	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
+	indexURL := baseURL + url.PathEscape(job.FileName)
+
 	completionOpts := []styling.StyledTextOption{
 		styling.Bold("✅ Mirror Complete!\n\n"),
-		styling.Bold("File:"), styling.Plain(fmt.Sprintf(" %s\n", job.FileName)),
-		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s", driveURL)),
+		styling.Bold("File:"), styling.Plain(" "), styling.Code(job.FileName), styling.Plain("\n"),
+		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s\n", driveURL)),
 	}
+	if ts.cfg.IndexBaseURL != "" {
+		completionOpts = append(completionOpts, styling.Bold("Index Link:"), styling.Plain(fmt.Sprintf(" %s", indexURL)))
+	}
+
 	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
 }
 

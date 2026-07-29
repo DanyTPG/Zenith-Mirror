@@ -154,7 +154,6 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 	for {
 		select {
 		case <-jobCtx.Done():
-			// When all jobs complete, delete status message
 			if statusMsgID > 0 {
 				_, _ = ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
 					Revoke: true,
@@ -193,35 +192,118 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, "telegram_media", 0, userID)
+	replyHeader, ok := msg.ReplyTo.(*tg.MessageReplyHeader)
+	if !ok || replyHeader.ReplyToMsgID == 0 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Could not find replied message ID.")
+		return err
+	}
+
+	res, err := ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
+		&tg.InputMessageID{ID: replyHeader.ReplyToMsgID},
+	})
+	if err != nil {
+		slog.Error("failed fetching replied message", "error", err)
+		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Failed fetching target message: %v", err))
+		return replyErr
+	}
+
+	var messagesSlice []tg.MessageClass
+	switch m := res.(type) {
+	case *tg.MessagesMessages:
+		messagesSlice = m.Messages
+	case *tg.MessagesMessagesSlice:
+		messagesSlice = m.Messages
+	case *tg.MessagesChannelMessages:
+		messagesSlice = m.Messages
+	}
+
+	if len(messagesSlice) == 0 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Replied message no longer available.")
+		return err
+	}
+
+	targetMsg, ok := messagesSlice[0].(*tg.Message)
+	if !ok || targetMsg.Media == nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Replied message contains no downloadable media.")
+		return err
+	}
+
+	fileName, fileSize, location, err := extractMediaInfo(targetMsg.Media)
+	if err != nil {
+		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Media error: %v", err))
+		return replyErr
+	}
+
+	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID)
 	if err != nil {
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 		return replyErr
 	}
 
 	go ts.startLiveStatusUpdater(job.Ctx, entities, update)
-	go ts.executeMirrorJob(job, entities, update)
+	go ts.executeMirrorJob(job, location, entities, update)
 
 	return nil
 }
 
-func (ts *TelegramService) executeMirrorJob(job *Job, entities tg.Entities, update *tg.UpdateNewMessage) {
+func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLocationClass, error) {
+	switch m := media.(type) {
+	case *tg.MessageMediaDocument:
+		doc, ok := m.Document.AsNotEmpty()
+		if !ok {
+			return "", 0, nil, fmt.Errorf("empty document")
+		}
+		name := "document"
+		for _, attr := range doc.Attributes {
+			if filenameAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+				name = filenameAttr.FileName
+				break
+			}
+		}
+		loc := &tg.InputDocumentFileLocation{
+			ID:            doc.ID,
+			AccessHash:    doc.AccessHash,
+			FileReference: doc.FileReference,
+		}
+		return name, doc.Size, loc, nil
+	case *tg.MessageMediaPhoto:
+		photo, ok := m.Photo.AsNotEmpty()
+		if !ok {
+			return "", 0, nil, fmt.Errorf("empty photo")
+		}
+		loc := &tg.InputPhotoFileLocation{
+			ID:            photo.ID,
+			AccessHash:    photo.AccessHash,
+			FileReference: photo.FileReference,
+			ThumbSize:     "x",
+		}
+		return "photo.jpg", 0, loc, nil
+	default:
+		return "", 0, nil, fmt.Errorf("unsupported media type")
+	}
+}
+
+func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
 	defer ts.jm.FinishJob(job.ID)
 
-	slog.Info("executing mirror job", "job_id", job.ID)
-	job.Status = "Mirroring Telegram Media to Google Drive"
+	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName)
+	job.Status = "Streaming from Telegram to Google Drive"
 
 	pr, pw := io.Pipe()
+
+	go func() {
+		defer pw.Close()
+		_, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, pw)
+		if err != nil {
+			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
+		}
+	}()
 
 	progressReader := NewProgressReader(pr, job.Size, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
 		job.Speed = speed
 		job.ETA = eta
 	})
-
-	go func() {
-		defer pw.Close()
-	}()
 
 	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, job.Size)
 	if err != nil {
@@ -232,7 +314,7 @@ func (ts *TelegramService) executeMirrorJob(job *Job, entities tg.Entities, upda
 
 	job.Status = "Completed"
 	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
-	_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("✅ Mirror Complete!\nGoogle Drive Link: %s", driveURL))
+	_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("✅ Mirror Complete!\n\nFile: %s\nGoogle Drive Link: %s", job.FileName, driveURL))
 }
 
 func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -157,7 +158,7 @@ func (ts *TelegramService) registerRoutes() {
 		} else if strings.HasPrefix(text, "/cancel") {
 			return ts.handleCancel(ctx, entities, update, msg, text)
 		} else if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m") {
-			return ts.handleMirror(ctx, entities, update, msg, senderID)
+			return ts.handleMirror(ctx, entities, update, msg, text, senderID)
 		} else if strings.HasPrefix(text, "/leech") {
 			return ts.handleLeech(ctx, entities, update, msg, text, senderID)
 		}
@@ -172,7 +173,7 @@ func (ts *TelegramService) handleStart(ctx context.Context, entities tg.Entities
 		styling.Plain("\n\n"),
 		styling.Bold("Available Commands:"),
 		styling.Plain("\n"),
-		styling.Plain("• `/mirror` or `/m` (Reply to media to upload to Google Drive)\n"),
+		styling.Plain("• `/mirror` or `/m [-i count]` (Reply to media to upload to Google Drive)\n"),
 		styling.Plain("• `/leech <url>` (Download direct link to Telegram)\n"),
 		styling.Plain("• `/status` (Check active jobs)\n"),
 		styling.Plain("• `/stats` (View system & bot statistics)\n"),
@@ -445,9 +446,9 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	return err
 }
 
-func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, userID int64) error {
+func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
 	if msg.ReplyTo == nil {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror (or /m) to upload it to Google Drive.")
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror or /m [-i count] to upload to Google Drive.")
 		return err
 	}
 
@@ -457,50 +458,69 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	res, err := ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
-		&tg.InputMessageID{ID: replyHeader.ReplyToMsgID},
-	})
-	if err != nil {
-		slog.Error("failed fetching replied message", "error", err)
-		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Failed fetching target message: %v", err))
-		return replyErr
+	count := 1
+	parts := strings.Fields(text)
+	for i, part := range parts {
+		if part == "-i" && i+1 < len(parts) {
+			if parsed, err := strconv.Atoi(parts[i+1]); err == nil && parsed > 0 {
+				count = parsed
+			}
+		}
 	}
 
-	var messagesSlice []tg.MessageClass
-	switch m := res.(type) {
-	case *tg.MessagesMessages:
-		messagesSlice = m.Messages
-	case *tg.MessagesMessagesSlice:
-		messagesSlice = m.Messages
-	case *tg.MessagesChannelMessages:
-		messagesSlice = m.Messages
+	startMsgID := replyHeader.ReplyToMsgID
+	queuedJobs := 0
+
+	for offset := 0; offset < count; offset++ {
+		targetID := startMsgID + offset
+
+		res, err := ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
+			&tg.InputMessageID{ID: targetID},
+		})
+		if err != nil {
+			slog.Error("failed fetching message for batch mirror", "msg_id", targetID, "error", err)
+			continue
+		}
+
+		var messagesSlice []tg.MessageClass
+		switch m := res.(type) {
+		case *tg.MessagesMessages:
+			messagesSlice = m.Messages
+		case *tg.MessagesMessagesSlice:
+			messagesSlice = m.Messages
+		case *tg.MessagesChannelMessages:
+			messagesSlice = m.Messages
+		}
+
+		if len(messagesSlice) == 0 {
+			continue
+		}
+
+		targetMsg, ok := messagesSlice[0].(*tg.Message)
+		if !ok || targetMsg.Media == nil {
+			continue
+		}
+
+		fileName, fileSize, location, err := extractMediaInfo(targetMsg.Media)
+		if err != nil {
+			continue
+		}
+
+		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID)
+		if err != nil {
+			slog.Warn("could not create mirror job", "msg_id", targetID, "error", err)
+			continue
+		}
+
+		queuedJobs++
+		go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+		go ts.executeMirrorJob(job, location, entities, update)
 	}
 
-	if len(messagesSlice) == 0 {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Replied message no longer available.")
+	if queuedJobs == 0 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "No downloadable media files found in the requested range.")
 		return err
 	}
-
-	targetMsg, ok := messagesSlice[0].(*tg.Message)
-	if !ok || targetMsg.Media == nil {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Replied message contains no downloadable media.")
-		return err
-	}
-
-	fileName, fileSize, location, err := extractMediaInfo(targetMsg.Media)
-	if err != nil {
-		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Media error: %v", err))
-		return replyErr
-	}
-
-	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID)
-	if err != nil {
-		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
-		return replyErr
-	}
-
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
-	go ts.executeMirrorJob(job, location, entities, update)
 
 	return nil
 }

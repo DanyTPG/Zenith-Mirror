@@ -26,12 +26,17 @@ func main() {
 	}
 
 	jm := NewJobManager(cfg.MaxConcurrency)
-	_ = jm
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	tg, err := NewTelegramService(cfg)
+	gdrive, err := NewGDriveService(ctx, cfg.GDriveSAFile, cfg.GDriveFolderID)
+	if err != nil {
+		slog.Error("failed to initialize gdrive service", "error", err)
+		os.Exit(1)
+	}
+
+	tg, err := NewTelegramService(cfg, jm, gdrive)
 	if err != nil {
 		slog.Error("failed to initialize telegram service", "error", err)
 		os.Exit(1)
@@ -40,7 +45,7 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- tg.Run(ctx, func(ctx context.Context) error {
-			slog.Info("Zenith-Mirror bot engine running")
+			slog.Info("Zenith-Mirror bot engine running and listening for commands")
 			<-ctx.Done()
 			return nil
 		})

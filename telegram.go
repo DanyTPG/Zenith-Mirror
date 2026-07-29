@@ -166,15 +166,19 @@ func (ts *TelegramService) registerRoutes() {
 }
 
 func (ts *TelegramService) handleStart(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-	welcomeMsg := "⚡ *Zenith-Mirror Bot*\n\n" +
-		"Available Commands:\n" +
-		"• `/mirror` or `/m` (Reply to media to upload to Google Drive)\n" +
-		"• `/leech <url>` (Download direct link to Telegram)\n" +
-		"• `/status` (Check active jobs)\n" +
-		"• `/stats` (View system & bot statistics)\n" +
-		"• `/cancel <job_id>` (Cancel transfer)\n" +
-		"• `/restart` (Restart bot service)"
-	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(welcomeMsg))
+	opts := []styling.StyledTextOption{
+		styling.Bold("⚡ Zenith-Mirror Bot"),
+		styling.Plain("\n\n"),
+		styling.Bold("Available Commands:"),
+		styling.Plain("\n"),
+		styling.Plain("• `/mirror` or `/m` (Reply to media to upload to Google Drive)\n"),
+		styling.Plain("• `/leech <url>` (Download direct link to Telegram)\n"),
+		styling.Plain("• `/status` (Check active jobs)\n"),
+		styling.Plain("• `/stats` (View system & bot statistics)\n"),
+		styling.Plain("• `/cancel <job_id>` (Cancel transfer)\n"),
+		styling.Plain("• `/restart` (Restart bot service)"),
+	}
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
 	return err
 }
 
@@ -238,20 +242,27 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 		swapPercent = s.UsedPercent
 	}
 
-	statsText := fmt.Sprintf("Bot Uptime: %s\nOS Uptime: %s\n\n"+
-		"Total Disk Space: %s\nUsed: %s | Free: %s\n\n"+
-		"Upload: %s\nDownload: %s\n\n"+
-		"CPU: %.1f%%\nRAM: %.1f%%\nDISK: %.1f%%\n\n"+
-		"Physical Cores: %d\nTotal Cores: %d\n\n"+
-		"SWAP: %s (%s) | Used: %.1f%%\nMemory Total: %s\nMemory Free: %s\nMemory Used: %s",
-		botUptime, osUptimeStr,
-		totalDisk, usedDisk, freeDisk,
-		netSent, netRecv,
-		cpuPercent, memPercent, diskPercent,
-		physCores, totalCores,
-		swapTotal, swapUsed, swapPercent, memTotal, memFree, memUsed)
+	opts := []styling.StyledTextOption{
+		styling.Bold("Bot Uptime:"), styling.Plain(fmt.Sprintf(" %s\n", botUptime)),
+		styling.Bold("OS Uptime:"), styling.Plain(fmt.Sprintf(" %s\n\n", osUptimeStr)),
+		styling.Bold("Total Disk Space:"), styling.Plain(fmt.Sprintf(" %s\n", totalDisk)),
+		styling.Bold("Used:"), styling.Plain(fmt.Sprintf(" %s | ", usedDisk)),
+		styling.Bold("Free:"), styling.Plain(fmt.Sprintf(" %s\n\n", freeDisk)),
+		styling.Bold("Upload:"), styling.Plain(fmt.Sprintf(" %s\n", netSent)),
+		styling.Bold("Download:"), styling.Plain(fmt.Sprintf(" %s\n\n", netRecv)),
+		styling.Bold("CPU:"), styling.Plain(fmt.Sprintf(" %.1f%%\n", cpuPercent)),
+		styling.Bold("RAM:"), styling.Plain(fmt.Sprintf(" %.1f%%\n", memPercent)),
+		styling.Bold("DISK:"), styling.Plain(fmt.Sprintf(" %.1f%%\n\n", diskPercent)),
+		styling.Bold("Physical Cores:"), styling.Plain(fmt.Sprintf(" %d\n", physCores)),
+		styling.Bold("Total Cores:"), styling.Plain(fmt.Sprintf(" %d\n\n", totalCores)),
+		styling.Bold("SWAP:"), styling.Plain(fmt.Sprintf(" %s (%s) | ", swapTotal, swapUsed)),
+		styling.Bold("Used:"), styling.Plain(fmt.Sprintf(" %.1f%%\n", swapPercent)),
+		styling.Bold("Memory Total:"), styling.Plain(fmt.Sprintf(" %s\n", memTotal)),
+		styling.Bold("Memory Free:"), styling.Plain(fmt.Sprintf(" %s\n", memFree)),
+		styling.Bold("Memory Used:"), styling.Plain(fmt.Sprintf(" %s", memUsed)),
+	}
 
-	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(statsText))
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
 	return err
 }
 
@@ -304,12 +315,16 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 			phaseName = "Upload"
 		}
 
-		options = append(options, styling.Plain(fmt.Sprintf("%d.%s: ", i+1, phaseName)))
+		options = append(options, styling.Bold(fmt.Sprintf("%d.%s:", i+1, phaseName)))
+		options = append(options, styling.Plain(" "))
 		options = append(options, styling.Code(j.FileName))
-		options = append(options, styling.Plain(fmt.Sprintf("\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n",
-			bar, pct,
-			FormatBytes(j.ReadBytes), FormatBytes(j.Size),
-			FormatBytes(int64(j.Speed)), etaStr)))
+		options = append(options, styling.Plain(fmt.Sprintf("\n%s %.2f%%\n", bar, pct)))
+		options = append(options, styling.Bold("Processed:"))
+		options = append(options, styling.Plain(fmt.Sprintf(" %s of %s\n", FormatBytes(j.ReadBytes), FormatBytes(j.Size))))
+		options = append(options, styling.Bold("Speed:"))
+		options = append(options, styling.Plain(fmt.Sprintf(" %s/s | ", FormatBytes(int64(j.Speed)))))
+		options = append(options, styling.Bold("ETA:"))
+		options = append(options, styling.Plain(fmt.Sprintf(" %s\n", etaStr)))
 		options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
 		options = append(options, styling.Plain("\n\n"))
 	}
@@ -334,9 +349,14 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
 	}
 
-	summary := fmt.Sprintf("CPU: %.1f%% | FREE: %s\nRAM: %.1f%% | UPTIME: %s",
-		cpuPercent, freeDisk, memPercent, osUptimeStr)
-	options = append(options, styling.Plain(summary))
+	options = append(options, styling.Bold("CPU:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %.1f%% | ", cpuPercent)))
+	options = append(options, styling.Bold("FREE:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s\n", freeDisk)))
+	options = append(options, styling.Bold("RAM:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %.1f%% | ", memPercent)))
+	options = append(options, styling.Bold("UPTIME:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s", osUptimeStr)))
 
 	return options
 }
@@ -558,7 +578,13 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 
 	job.Status = "Completed"
 	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
-	_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("✅ Mirror Complete!\n\nFile: %s\nGoogle Drive Link: %s", job.FileName, driveURL))
+
+	completionOpts := []styling.StyledTextOption{
+		styling.Bold("✅ Mirror Complete!\n\n"),
+		styling.Bold("File:"), styling.Plain(fmt.Sprintf(" %s\n", job.FileName)),
+		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s", driveURL)),
+	}
+	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
 }
 
 func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {

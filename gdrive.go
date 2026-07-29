@@ -11,9 +11,9 @@ import (
 	"google.golang.org/api/option"
 )
 
-// DriveChunkSize must be a multiple of 256 KiB per Google Drive API requirements.
-// Default to 8MB (32 * 256KiB) for stream performance.
-const DriveChunkSize = 8 * 1024 * 1024
+// DriveChunkSize must be a multiple of 256 KiB.
+// 1 MB (4 * 256 KiB) is ideal for fast streaming start.
+const DriveChunkSize = 1024 * 1024
 
 type GDriveService struct {
 	service  *drive.Service
@@ -39,11 +39,7 @@ func (g *GDriveService) UploadStream(ctx context.Context, name string, reader io
 	}
 
 	call := g.service.Files.Create(fileMeta).Context(ctx)
-
-	var opts []googleapi.MediaOption
-	opts = append(opts, googleapi.ChunkSize(DriveChunkSize))
-
-	call.Media(reader, opts...)
+	call.Media(reader, googleapi.ChunkSize(DriveChunkSize))
 
 	res, err := call.Do()
 	if err != nil {

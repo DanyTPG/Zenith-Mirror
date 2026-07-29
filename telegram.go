@@ -253,7 +253,7 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 		if !ok {
 			return "", 0, nil, fmt.Errorf("empty document")
 		}
-		name := "document"
+		name := "document.bin"
 		for _, attr := range doc.Attributes {
 			if filenameAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
 				name = filenameAttr.FileName
@@ -286,16 +286,19 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
 	defer ts.jm.FinishJob(job.ID)
 
-	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName)
+	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size)
 	job.Status = "Streaming from Telegram to Google Drive"
 
 	pr, pw := io.Pipe()
 
 	go func() {
 		defer pw.Close()
-		_, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, pw)
+		slog.Info("starting telegram media stream download", "job_id", job.ID)
+		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, pw)
 		if err != nil {
 			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
+		} else {
+			slog.Info("telegram media download stream finished", "job_id", job.ID, "bytes_written", written)
 		}
 	}()
 
@@ -303,6 +306,7 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 		job.ReadBytes = read
 		job.Speed = speed
 		job.ETA = eta
+		slog.Info("mirror progress", "job_id", job.ID, "read", FormatBytes(read), "total", FormatBytes(total), "speed_kbps", speed/1024)
 	})
 
 	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, job.Size)

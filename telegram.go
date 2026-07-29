@@ -105,7 +105,9 @@ func NewTelegramService(cfg *Config, jm *JobManager, gdrive *GDriveService) (*Te
 	}
 
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, opts)
-	dl := downloader.NewDownloader()
+	dl := downloader.NewDownloader().
+		WithPartSize(512 * 1024). // 512KB parts — max allowed by Telegram, fewer round-trips
+		WithAllowCDN(true)        // use CDN nodes when available
 	api := client.API()
 	ul := uploader.NewUploader(api)
 	sender := message.NewSender(api)

@@ -131,11 +131,22 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 	defer ticker.Stop()
 
 	initialText := ts.buildStatusText()
-	statusBuilder := ts.sender.Reply(entities, update)
-	_, err := statusBuilder.StyledText(jobCtx, styling.Plain(initialText))
+	updates, err := ts.sender.Reply(entities, update).StyledText(jobCtx, styling.Plain(initialText))
 	if err != nil {
 		slog.Error("failed sending live status message", "error", err)
 		return
+	}
+
+	var statusMsgID int
+	if u, ok := updates.(*tg.Updates); ok {
+		for _, up := range u.GetUpdates() {
+			if newMsg, ok := up.(*tg.UpdateNewMessage); ok {
+				statusMsgID = newMsg.Message.GetID()
+				break
+			}
+		}
+	} else if uShort, ok := updates.(*tg.UpdateShortMessage); ok {
+		statusMsgID = uShort.ID
 	}
 
 	var lastText string = initialText
@@ -143,13 +154,18 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 	for {
 		select {
 		case <-jobCtx.Done():
-			finalText := fmt.Sprintf("✅ Job Finished!\n\n%s", ts.buildStatusText())
-			_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), styling.Plain(finalText))
+			// When all jobs complete, delete status message
+			if statusMsgID > 0 {
+				_, _ = ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
+					Revoke: true,
+					ID:     []int{statusMsgID},
+				})
+			}
 			return
 		case <-ticker.C:
 			currentText := ts.buildStatusText()
-			if currentText != lastText {
-				_, _ = ts.sender.Reply(entities, update).StyledText(jobCtx, styling.Plain(currentText))
+			if currentText != lastText && statusMsgID > 0 {
+				_, _ = ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, styling.Plain(currentText))
 				lastText = currentText
 			}
 		}

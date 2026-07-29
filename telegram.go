@@ -274,18 +274,19 @@ func formatDuration(d time.Duration) string {
 }
 
 func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
-	text := ts.buildStatusText()
-	_, err := ts.sender.Reply(entities, update).StyledText(ctx, styling.Plain(text))
+	opts := ts.buildStatusStyledText()
+	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
 	return err
 }
 
-func (ts *TelegramService) buildStatusText() string {
+func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	jobs := ts.jm.GetActiveJobs()
 	if len(jobs) == 0 {
-		return "No active transfer jobs."
+		return []styling.StyledTextOption{styling.Plain("No active transfer jobs.")}
 	}
 
-	statusText := ""
+	var options []styling.StyledTextOption
+
 	for i, j := range jobs {
 		bar := RenderProgressBar(j.ReadBytes, j.Size, 12)
 		pct := 0.0
@@ -303,12 +304,14 @@ func (ts *TelegramService) buildStatusText() string {
 			phaseName = "Upload"
 		}
 
-		statusText += fmt.Sprintf("%d.%s: `%s`\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n`/cancel %s`\n\n",
-			i+1, phaseName, j.FileName,
+		options = append(options, styling.Plain(fmt.Sprintf("%d.%s: ", i+1, phaseName)))
+		options = append(options, styling.Code(j.FileName))
+		options = append(options, styling.Plain(fmt.Sprintf("\n%s %.2f%%\nProcessed: %s of %s\nSpeed: %s/s | ETA: %s\n",
 			bar, pct,
 			FormatBytes(j.ReadBytes), FormatBytes(j.Size),
-			FormatBytes(int64(j.Speed)), etaStr,
-			j.ID)
+			FormatBytes(int64(j.Speed)), etaStr)))
+		options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
+		options = append(options, styling.Plain("\n\n"))
 	}
 
 	cpuPercent := 0.0
@@ -331,10 +334,11 @@ func (ts *TelegramService) buildStatusText() string {
 		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
 	}
 
-	statusText += fmt.Sprintf("CPU: %.1f%% | FREE: %s\nRAM: %.1f%% | UPTIME: %s",
+	summary := fmt.Sprintf("CPU: %.1f%% | FREE: %s\nRAM: %.1f%% | UPTIME: %s",
 		cpuPercent, freeDisk, memPercent, osUptimeStr)
+	options = append(options, styling.Plain(summary))
 
-	return statusText
+	return options
 }
 
 func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
@@ -368,8 +372,8 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 	ticker := time.NewTicker(time.Duration(delay) * time.Second)
 	defer ticker.Stop()
 
-	initialText := ts.buildStatusText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(jobCtx, styling.Plain(initialText))
+	initialOpts := ts.buildStatusStyledText()
+	updates, err := ts.sender.Reply(entities, update).StyledText(jobCtx, initialOpts...)
 	if err != nil {
 		slog.Error("failed sending live status message", "error", err)
 		return
@@ -377,8 +381,6 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 
 	statusMsgID := extractMsgIDFromUpdates(updates)
 	slog.Info("created live status message", "status_msg_id", statusMsgID)
-
-	var lastText string = initialText
 
 	for {
 		select {
@@ -395,14 +397,12 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 			}
 			return
 		case <-ticker.C:
-			currentText := ts.buildStatusText()
-			if currentText != lastText && statusMsgID > 0 {
+			currentOpts := ts.buildStatusStyledText()
+			if statusMsgID > 0 {
 				slog.Info("editing live status message", "status_msg_id", statusMsgID)
-				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, styling.Plain(currentText))
+				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, currentOpts...)
 				if editErr != nil {
 					slog.Error("failed editing live status message", "status_msg_id", statusMsgID, "error", editErr)
-				} else {
-					lastText = currentText
 				}
 			}
 		}

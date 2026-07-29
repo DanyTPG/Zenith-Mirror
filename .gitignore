@@ -1,0 +1,21 @@
+# Binaries & build artifacts
+/zenith-mirror
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Environment & Credentials
+.env
+*.json
+!example.config.json
+service_account.json
+session.json
+
+# Temporary download / cache files
+/downloads/
+/tmp/
+*.tmp

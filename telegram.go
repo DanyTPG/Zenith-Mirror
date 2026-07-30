@@ -469,8 +469,44 @@ func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Enti
 }
 
 func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
+	parts := strings.Fields(text)
+
+	// Check if a direct URL was passed: /mirror <url> or /m <url>
+	var rawURL string
+	for _, part := range parts[1:] {
+		if strings.HasPrefix(part, "http://") || strings.HasPrefix(part, "https://") {
+			rawURL = part
+			break
+		}
+	}
+
+	if rawURL != "" {
+		urlParts := strings.Split(rawURL, "/")
+		fileName := urlParts[len(urlParts)-1]
+		if fileName == "" {
+			fileName = "downloaded_file.bin"
+		}
+
+		var jobRef *Job
+		execFunc := func() {
+			ts.executeURLMirrorJob(jobRef, rawURL, entities, update)
+		}
+
+		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, 0, userID, execFunc)
+		if err != nil {
+			slog.Error("failed creating URL mirror job", "error", err)
+			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+			return replyErr
+		}
+		jobRef = job
+
+		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
+		go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+		return nil
+	}
+
 	if msg.ReplyTo == nil {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Reply to a media/file message with /mirror or /m [-i count] to upload to Google Drive.")
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /mirror <url> OR reply to a media message with /mirror [-i count] to upload to Google Drive.")
 		return err
 	}
 
@@ -481,7 +517,6 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	}
 
 	count := 1
-	parts := strings.Fields(text)
 	for i, part := range parts {
 		if part == "-i" && i+1 < len(parts) {
 			if parsed, err := strconv.Atoi(parts[i+1]); err == nil && parsed > 0 {
@@ -589,8 +624,81 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 	}
 }
 
-func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
+func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities tg.Entities, update *tg.UpdateNewMessage) {
 	defer ts.jm.FinishJob(job.ID)
+
+	slog.Info("executing URL mirror job", "job_id", job.ID, "url", rawURL)
+	job.Phase = PhaseDownloading
+	job.Status = "Downloading from HTTP URL"
+
+	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
+	if err != nil {
+		slog.Error("invalid URL for mirror", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
+
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("URL download request failed", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Error("URL download non-200 status", "job_id", job.ID, "status", resp.Status)
+		job.Status = fmt.Sprintf("HTTP Error %s", resp.Status)
+		return
+	}
+
+	job.Size = resp.ContentLength
+	urlParts := strings.Split(rawURL, "/")
+	job.FileName = urlParts[len(urlParts)-1]
+	if job.FileName == "" {
+		job.FileName = "downloaded_file.bin"
+	}
+
+	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
+	})
+
+	job.Phase = PhaseUploading
+	job.Status = "Uploading to Google Drive"
+
+	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
+	if err != nil {
+		slog.Error("gdrive upload failed for URL mirror", "job_id", job.ID, "error", err)
+		job.Status = fmt.Sprintf("Failed: %v", err)
+		return
+	}
+
+	job.Status = "Completed"
+	slog.Info("URL mirror job completed", "job_id", job.ID, "drive_url", driveURL)
+
+	baseURL := ts.cfg.IndexBaseURL
+	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
+	indexURL := baseURL + url.PathEscape(job.FileName)
+
+	completionOpts := []styling.StyledTextOption{
+		styling.Bold("✅ Mirror Complete!\n\n"),
+		styling.Bold("File:"), styling.Plain(" "), styling.Code(job.FileName), styling.Plain("\n"),
+		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s\n", driveURL)),
+	}
+	if ts.cfg.IndexBaseURL != "" {
+		completionOpts = append(completionOpts, styling.Bold("Index Link:"), styling.Plain(fmt.Sprintf(" %s", indexURL)))
+	}
+
+	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
+}
+
+func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size, "mode", ts.cfg.DownloadMode)
 	job.Phase = PhaseDownloading

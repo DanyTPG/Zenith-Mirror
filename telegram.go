@@ -412,6 +412,24 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
 	}
 
+	var totalDLSpeed, totalULSpeed float64
+	for _, j := range jobs {
+		if j.State == StateQueued {
+			continue
+		}
+		if j.Phase == PhaseDownloading {
+			totalDLSpeed += j.Speed
+		} else {
+			totalULSpeed += j.Speed
+		}
+	}
+
+	options = append(options, styling.Plain("\n"))
+	options = append(options, styling.Bold("Total DL:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s/s | ", FormatBytes(int64(totalDLSpeed)))))
+	options = append(options, styling.Bold("Total UL:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s/s\n", FormatBytes(int64(totalULSpeed)))))
+
 	options = append(options, styling.Bold("CPU:"))
 	options = append(options, styling.Plain(fmt.Sprintf(" %.1f%% | ", cpuPercent)))
 	options = append(options, styling.Bold("FREE:"))

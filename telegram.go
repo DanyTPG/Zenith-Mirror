@@ -29,17 +29,18 @@ import (
 )
 
 type TelegramService struct {
-	client      *telegram.Client
-	downloader  *downloader.Downloader
-	uploader    *uploader.Uploader
-	sender      *message.Sender
-	cfg         *Config
-	gdrive      *GDriveService
-	jm          *JobManager
-	dispatcher  *tg.UpdateDispatcher
-	startTime   time.Time
+	client       *telegram.Client
+	downloader   *downloader.Downloader
+	uploader     *uploader.Uploader
+	sender       *message.Sender
+	cfg          *Config
+	gdrive       *GDriveService
+	jm           *JobManager
+	dispatcher   *tg.UpdateDispatcher
+	startTime    time.Time
 	lastStatusMu sync.Mutex
 	lastStatusID int
+	lastStatusFn context.CancelFunc
 }
 
 type ProgressWriter struct {
@@ -297,7 +298,11 @@ func formatDuration(d time.Duration) string {
 func (ts *TelegramService) deleteLastStatus() {
 	ts.lastStatusMu.Lock()
 	id := ts.lastStatusID
+	fn := ts.lastStatusFn
 	ts.lastStatusMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 	if id <= 0 {
 		return
 	}
@@ -311,9 +316,10 @@ func (ts *TelegramService) deleteLastStatus() {
 	}
 }
 
-func (ts *TelegramService) setLastStatusID(id int) {
+func (ts *TelegramService) setLastStatus(id int, cancelFn context.CancelFunc) {
 	ts.lastStatusMu.Lock()
 	ts.lastStatusID = id
+	ts.lastStatusFn = cancelFn
 	ts.lastStatusMu.Unlock()
 }
 
@@ -321,6 +327,7 @@ func (ts *TelegramService) clearLastStatusIf(id int) {
 	ts.lastStatusMu.Lock()
 	if ts.lastStatusID == id {
 		ts.lastStatusID = 0
+		ts.lastStatusFn = nil
 	}
 	ts.lastStatusMu.Unlock()
 }
@@ -332,7 +339,7 @@ func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entitie
 	if err != nil {
 		return err
 	}
-	ts.setLastStatusID(extractMsgIDFromUpdates(updates))
+	ts.setLastStatus(extractMsgIDFromUpdates(updates), nil)
 	return nil
 }
 
@@ -441,6 +448,10 @@ func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
 }
 
 func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) {
+	ts.deleteLastStatus()
+
+	statusCtx, statusCancel := context.WithCancel(jobCtx)
+
 	delay := ts.cfg.StatusRefreshDelay
 	if delay <= 0 {
 		delay = 5
@@ -448,22 +459,21 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 	ticker := time.NewTicker(time.Duration(delay) * time.Second)
 	defer ticker.Stop()
 
-	ts.deleteLastStatus()
-
 	initialOpts := ts.buildStatusStyledText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(jobCtx, initialOpts...)
+	updates, err := ts.sender.Reply(entities, update).StyledText(statusCtx, initialOpts...)
 	if err != nil {
 		slog.Error("failed sending live status message", "error", err)
+		statusCancel()
 		return
 	}
 
 	statusMsgID := extractMsgIDFromUpdates(updates)
-	ts.setLastStatusID(statusMsgID)
+	ts.setLastStatus(statusMsgID, statusCancel)
 	slog.Info("created live status message", "status_msg_id", statusMsgID)
 
 	for {
 		select {
-		case <-jobCtx.Done():
+		case <-statusCtx.Done():
 			ts.clearLastStatusIf(statusMsgID)
 			if statusMsgID > 0 {
 				slog.Info("deleting completed job live status message", "status_msg_id", statusMsgID)
@@ -480,7 +490,7 @@ func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entiti
 			currentOpts := ts.buildStatusStyledText()
 			if statusMsgID > 0 {
 				slog.Info("editing live status message", "status_msg_id", statusMsgID)
-				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(jobCtx, currentOpts...)
+				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(statusCtx, currentOpts...)
 				if editErr != nil {
 					slog.Error("failed editing live status message", "status_msg_id", statusMsgID, "error", editErr)
 				}

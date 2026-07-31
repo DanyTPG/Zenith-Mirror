@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/session"
@@ -850,14 +851,14 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 }
 
 // progressWriterAt wraps an io.WriterAt to track total bytes written (for parallel downloads)
+// Uses atomic ops instead of mutex to avoid contention across threads.
 type progressWriterAt struct {
 	dest       io.WriterAt
 	totalBytes int64
 	written    int64
 	startTime  time.Time
 	onProgress func(read, total int64, speed float64, eta time.Duration)
-	lastNotify time.Time
-	mu         sync.Mutex
+	lastNotify int64 // unix nano, atomic
 }
 
 func newProgressWriterAt(dest io.WriterAt, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *progressWriterAt {
@@ -872,20 +873,13 @@ func newProgressWriterAt(dest io.WriterAt, totalBytes int64, onProgress func(rea
 func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	n, err := pw.dest.WriteAt(p, off)
 	if n > 0 {
-		pw.mu.Lock()
-		pw.written += int64(n)
-		written := pw.written
-		now := time.Now()
-		shouldNotify := now.Sub(pw.lastNotify) >= 1*time.Second
-		if shouldNotify {
-			pw.lastNotify = now
-		}
-		pw.mu.Unlock()
-
-		if shouldNotify && pw.onProgress != nil {
-			elapsed := now.Sub(pw.startTime).Seconds()
-			if elapsed > 0 {
-				speed := float64(written) / elapsed
+		written := atomic.AddInt64(&pw.written, int64(n))
+		now := time.Now().UnixNano()
+		last := atomic.LoadInt64(&pw.lastNotify)
+		if now-last >= int64(1*time.Second) && atomic.CompareAndSwapInt64(&pw.lastNotify, last, now) {
+			elapsed := now - pw.startTime.UnixNano()
+			if elapsed > 0 && pw.onProgress != nil {
+				speed := float64(written) / (float64(elapsed) / float64(time.Second))
 				var eta time.Duration
 				if speed > 0 && pw.totalBytes > written {
 					eta = time.Duration(float64(pw.totalBytes-written)/speed) * time.Second

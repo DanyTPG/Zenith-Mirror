@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -42,6 +43,7 @@ type Job struct {
 	State     JobState
 	Status    string
 	UserID    int64
+	Order     int
 	Ctx       context.Context
 	Cancel    context.CancelFunc
 	Execute   func()
@@ -84,6 +86,7 @@ func (jm *JobManager) CreateJob(ctx context.Context, jobType JobType, fileName s
 		State:     StateQueued,
 		Status:    "Queued",
 		UserID:    userID,
+		Order:     int(jm.jobCounter),
 		Ctx:       jobCtx,
 		Cancel:    cancel,
 		Execute:   execute,
@@ -203,6 +206,9 @@ func (jm *JobManager) GetActiveJobs() []*Job {
 	for _, j := range jm.active {
 		jobs = append(jobs, j)
 	}
+	sort.Slice(jobs, func(i, k int) bool {
+		return jobs[i].Order < jobs[k].Order
+	})
 	return jobs
 }
 

@@ -919,17 +919,8 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		}
 	}()
 
-	// Try parallel first, fall back to stream if threads=1
-	if threads > 1 {
-		_, err = ts.downloader.Download(ts.client.API(), location).
-			WithThreads(threads).
-			WithVerify(false).
-			Parallel(job.Ctx, counter)
-	} else {
-		_, err = ts.downloader.Download(ts.client.API(), location).
-			WithVerify(false).
-			Stream(job.Ctx, counter)
-	}
+	// Use fast pipelined download for Telegram files
+	err = fastDownload(job.Ctx, ts.client.API(), location, job.Size, tmpFile, counter)
 
 	close(done)
 

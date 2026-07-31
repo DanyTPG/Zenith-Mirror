@@ -264,6 +264,8 @@ func (ts *TelegramService) deleteLastStatus() {
 	ts.lastStatusMu.Lock()
 	id := ts.lastStatusID
 	fn := ts.lastStatusFn
+	ts.lastStatusID = 0
+	ts.lastStatusFn = nil
 	ts.lastStatusMu.Unlock()
 	if fn != nil {
 		fn()
@@ -439,6 +441,7 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 		case <-ticker.C:
 			activeJobs := ts.jm.GetActiveJobs()
 			if len(activeJobs) == 0 {
+				slog.Info("no active jobs, deleting status", "msg_id", msgID)
 				ts.deleteLastStatus()
 				return
 			}
@@ -460,6 +463,13 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 					statusDelay = 3 * time.Second
 					ticker.Reset(statusDelay)
 				}
+			}
+
+			// Check after edit — job may have finished during edit
+			if len(ts.jm.GetActiveJobs()) == 0 {
+				slog.Info("no active jobs after edit, deleting status", "msg_id", msgID)
+				ts.deleteLastStatus()
+				return
 			}
 		}
 	}

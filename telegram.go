@@ -648,7 +648,7 @@ func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg
 	}
 
 	completionOpts := []styling.StyledTextOption{
-		styling.Bold("Name: "), styling.Plain(job.FileName), styling.Plain("\n"),
+		styling.Bold("Name: "), styling.Code(job.FileName), styling.Plain("\n"),
 		styling.Bold("Size: "), styling.Plain(FormatBytes(job.Size)), styling.Plain("\n"),
 		styling.Bold("Type: "), styling.Plain(mimeType),
 	}

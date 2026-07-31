@@ -99,7 +99,7 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 			return ts.handleCancel(ctx, entities, update, text)
 		}
 
-		if strings.HasPrefix(text, "/mirror") {
+		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
 			return ts.handleMirror(ctx, entities, update, msg, text, userID)
 		}
 

@@ -37,6 +37,12 @@ type TelegramService struct {
 	lastStatusID int
 	lastStatusFn context.CancelFunc
 	lastStatusMu sync.Mutex
+	// Pool cache: one pool per remote DC, shared across jobs
+	poolMu    sync.Mutex
+	poolCache map[int]struct {
+		invoker tg.Invoker
+		closer  io.Closer
+	}
 }
 
 func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
@@ -47,6 +53,10 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 		jm:        jm,
 		cfg:       cfg,
 		startTime: time.Now(),
+		poolCache: make(map[int]struct {
+			invoker tg.Invoker
+			closer  io.Closer
+		}),
 	}
 	ts.downloader = NewLeechPipeline(ts)
 	return ts
@@ -373,7 +383,11 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	var totalDL, totalUL float64
 	for _, j := range jobs {
 		if j.State == StateRunning {
-			totalDL += j.Speed
+			if j.Phase == PhaseUploading {
+				totalUL += j.Speed
+			} else {
+				totalDL += j.Speed
+			}
 		}
 	}
 
@@ -818,6 +832,43 @@ func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// getOrCreatePool returns a cached pool for the given DC, or creates one.
+func (ts *TelegramService) getOrCreatePool(ctx context.Context, location tg.InputFileLocationClass, threads int) (tg.Invoker, io.Closer, error) {
+	dc, err := detectFileDC(ctx, ts.client, location)
+	if err != nil {
+		return nil, nil, fmt.Errorf("detect file DC: %w", err)
+	}
+
+	ts.poolMu.Lock()
+	defer ts.poolMu.Unlock()
+
+	if cached, ok := ts.poolCache[dc]; ok {
+		return cached.invoker, cached.closer, nil
+	}
+
+	var invoker tg.Invoker
+	var closer io.Closer
+	if dc == 0 {
+		invoker, err = ts.client.Pool(int64(threads))
+	} else {
+		slog.Info("creating pool to remote DC", "dc", dc, "threads", threads)
+		invoker, err = ts.client.DC(ctx, dc, int64(threads))
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("create DC%d pool: %w", dc, err)
+	}
+	closer, ok := invoker.(io.Closer)
+	if !ok {
+		closer = io.NopCloser(nil)
+	}
+
+	ts.poolCache[dc] = struct {
+		invoker tg.Invoker
+		closer  io.Closer
+	}{invoker, closer}
+	return invoker, closer, nil
+}
+
 func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFileLocationClass) (string, error) {
 	tmpFile, err := os.CreateTemp("", "zenith-dl-*")
 	if err != nil {
@@ -836,7 +887,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 
 	// Try to create multi-connection pool to remote DC for faster downloads
 	api := ts.client.API()
-	invoker, poolCloser, poolErr := createDownloadPool(ctx, ts.client, location, int64(threads))
+	invoker, poolCloser, poolErr := ts.getOrCreatePool(ctx, location, threads)
 	if poolErr != nil {
 		slog.Warn("pool creation failed, using single connection", "error", poolErr)
 	} else {

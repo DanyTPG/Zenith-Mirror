@@ -107,6 +107,7 @@ func NewTelegramService(cfg *Config, jm *JobManager, gdrive *GDriveService) (*Te
 	opts := telegram.Options{
 		SessionStorage: storage,
 		UpdateHandler:  dispatcher,
+		AllowCDN:       true, // Enable CDN pool for faster downloads from edge nodes
 	}
 
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, opts)
@@ -919,8 +920,11 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		}
 	}()
 
-	// Use fast pipelined download for Telegram files
-	err = fastDownload(job.Ctx, ts.client.API(), location, job.Size, tmpFile, counter)
+	// Use CDN-aware download via client (handles CDN redirects automatically)
+	_, err = ts.client.Download(location).
+		WithThreads(threads).
+		WithVerify(false). // skip hash verification for speed
+		Parallel(job.Ctx, counter)
 
 	close(done)
 

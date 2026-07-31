@@ -819,6 +819,19 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 	return ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 }
 
+// atomicWriteAt wraps io.WriterAt with a single atomic counter for progress tracking.
+// Minimal overhead — no callbacks, no time checks per write.
+type atomicWriteAt struct {
+	file    io.WriterAt
+	written int64
+}
+
+func (a *atomicWriteAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := a.file.WriteAt(p, off)
+	atomic.AddInt64(&a.written, int64(n))
+	return n, err
+}
+
 // progressWriterAt wraps an io.WriterAt to track total bytes written (for parallel downloads)
 // Uses atomic ops instead of mutex to avoid contention across threads.
 type progressWriterAt struct {
@@ -872,8 +885,11 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	threads := ts.cfg.DownloadThreads
 	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", threads, "tmp", tmpFile.Name())
 
-	// Write directly to temp file — no progress wrapper overhead
-	// Track progress via a background goroutine that stats the file
+	// Wrap temp file with byte counter for progress tracking
+	counter := &atomicWriteAt{file: tmpFile}
+
+	// Write directly to temp file via counter — no progress wrapper overhead
+	// Track progress via a background goroutine
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -884,13 +900,13 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 			case <-done:
 				return
 			case <-ticker.C:
-				pos, _ := tmpFile.Seek(0, io.SeekCurrent)
+				written := atomic.LoadInt64(&counter.written)
 				elapsed := time.Since(start).Seconds()
 				if elapsed > 0 {
-					job.ReadBytes = pos
-					job.Speed = float64(pos) / elapsed
+					job.ReadBytes = written
+					job.Speed = float64(written) / elapsed
 					if job.Size > 0 {
-						remaining := float64(job.Size-pos) / job.Speed
+						remaining := float64(job.Size-written) / job.Speed
 						job.ETA = time.Duration(remaining * float64(time.Second))
 					}
 				}
@@ -898,11 +914,11 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		}
 	}()
 
-	// Parallel download with many threads — direct WriteAt to temp file
+	// Parallel download with many threads — direct WriteAt via counter
 	_, err = ts.downloader.Download(ts.client.API(), location).
 		WithThreads(threads).
 		WithVerify(false). // skip hash verification for speed
-		Parallel(job.Ctx, tmpFile)
+		Parallel(job.Ctx, counter)
 
 	close(done)
 

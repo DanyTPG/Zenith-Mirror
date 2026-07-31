@@ -383,7 +383,7 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	for {
 		select {
 		case <-statusCtx.Done():
-			ts.clearLastStatusIf(msgID)
+			ts.deleteLastStatus()
 			return
 		case <-ticker.C:
 			activeJobs := ts.jm.GetActiveJobs()

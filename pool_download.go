@@ -17,7 +17,7 @@ func detectFileDC(ctx context.Context, api *tg.Client, location tg.InputFileLoca
 	req := &tg.UploadGetFileRequest{
 		Location: location,
 		Offset:   0,
-		Limit:    1,
+		Limit:    4096, // minimum valid limit (must be multiple of 4KB)
 	}
 	req.SetPrecise(true)
 

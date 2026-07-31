@@ -8,223 +8,166 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/styling"
-	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
-	netstat "github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/net"
 )
 
 type TelegramService struct {
 	client       *telegram.Client
-	downloader   *downloader.Downloader
-	uploader     *uploader.Uploader
 	sender       *message.Sender
-	cfg          *Config
 	gdrive       *GDriveService
+	downloader   *LeechPipeline
 	jm           *JobManager
-	dispatcher   *tg.UpdateDispatcher
+	cfg          *Config
 	startTime    time.Time
-	lastStatusMu sync.Mutex
 	lastStatusID int
 	lastStatusFn context.CancelFunc
+	lastStatusMu sync.Mutex
 }
 
-type ProgressWriter struct {
-	writer     io.Writer
-	totalBytes int64
-	readBytes  int64
-	startTime  time.Time
-	onProgress func(read, total int64, speed float64, eta time.Duration)
-	lastNotify time.Time
-}
-
-func NewProgressWriter(w io.Writer, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *ProgressWriter {
-	return &ProgressWriter{
-		writer:     w,
-		totalBytes: totalBytes,
-		startTime:  time.Now(),
-		onProgress: onProgress,
-	}
-}
-
-func (pw *ProgressWriter) Write(p []byte) (int, error) {
-	n, err := pw.writer.Write(p)
-	if n > 0 {
-		pw.readBytes += int64(n)
-		pw.notifyIfNeeded()
-	}
-	return n, err
-}
-
-func (pw *ProgressWriter) notifyIfNeeded() {
-	if pw.onProgress == nil {
-		return
-	}
-	now := time.Now()
-	if now.Sub(pw.lastNotify) < 1*time.Second {
-		return
-	}
-	pw.lastNotify = now
-
-	read := pw.readBytes
-	elapsed := now.Sub(pw.startTime).Seconds()
-	if elapsed <= 0 {
-		return
-	}
-
-	speed := float64(read) / elapsed
-	var eta time.Duration
-	if speed > 0 && pw.totalBytes > read {
-		remainingBytes := pw.totalBytes - read
-		eta = time.Duration(float64(remainingBytes)/speed) * time.Second
-	}
-
-	pw.onProgress(read, pw.totalBytes, speed, eta)
-}
-
-func NewTelegramService(cfg *Config, jm *JobManager, gdrive *GDriveService) (*TelegramService, error) {
-	storage := &session.FileStorage{
-		Path: cfg.SessionFile,
-	}
-
-	dispatcher := tg.NewUpdateDispatcher()
-
-	opts := telegram.Options{
-		SessionStorage: storage,
-		UpdateHandler:  dispatcher,
-		AllowCDN:       true, // Enable CDN pool for faster downloads from edge nodes
-	}
-
-	client := telegram.NewClient(cfg.AppID, cfg.AppHash, opts)
-	dl := downloader.NewDownloader().
-		WithPartSize(512 * 1024). // 512KB parts — max allowed by Telegram, fewer round-trips
-		WithAllowCDN(true)        // use CDN nodes when available
-	api := client.API()
-	ul := uploader.NewUploader(api)
-	sender := message.NewSender(api)
-
+func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
 	ts := &TelegramService{
-		client:     client,
-		downloader: dl,
-		uploader:   ul,
-		sender:     sender,
-		cfg:        cfg,
-		gdrive:     gdrive,
-		jm:         jm,
-		dispatcher: &dispatcher,
-		startTime:  time.Now(),
+		client:    client,
+		sender:    message.NewSender(client.API()),
+		gdrive:    gdrive,
+		jm:        jm,
+		cfg:       cfg,
+		startTime: time.Now(),
 	}
-
-	ts.registerRoutes()
-
-	return ts, nil
+	ts.downloader = NewLeechPipeline(ts)
+	return ts
 }
 
-func (ts *TelegramService) registerRoutes() {
-	ts.dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
+	dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		msg, ok := update.Message.(*tg.Message)
 		if !ok || msg.Out {
 			return nil
 		}
 
-		var senderID int64
-		if peer, ok := msg.PeerID.(*tg.PeerUser); ok {
-			senderID = peer.UserID
-		}
-
-		slog.Info("received telegram message", "sender_id", senderID, "text", msg.Message)
-
-		if !ts.cfg.IsAllowed(senderID) {
-			slog.Warn("unauthorized user attempted command", "user_id", senderID)
+		text := strings.TrimSpace(msg.Message)
+		if text == "" {
 			return nil
 		}
 
-		text := strings.TrimSpace(msg.Message)
-		if text == "/start" {
-			return ts.handleStart(ctx, entities, update)
-		} else if strings.HasPrefix(text, "/status") {
-			return ts.handleStatus(ctx, entities, update, msg)
-		} else if text == "/stats" {
+		userID := ts.getUserID(msg)
+		if !ts.isAuthorized(userID) {
+			slog.Warn("unauthorized user access attempt", "user_id", userID, "text", text)
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "Unauthorized user.")
+			return err
+		}
+
+		if strings.HasPrefix(text, "/start") {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "Welcome to Zenith Mirror! Send /help for commands.")
+			return err
+		}
+
+		if strings.HasPrefix(text, "/help") {
+			helpText := "Available commands:\n" +
+				"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
+				"/leech <url> - Leech direct link to Telegram\n" +
+				"/status - View active transfer jobs\n" +
+				"/cancel <id> - Cancel an active job\n" +
+				"/stats - View system performance and resource usage\n" +
+				"/help - View this message"
+			_, err := ts.sender.Reply(entities, update).Text(ctx, helpText)
+			return err
+		}
+
+		if strings.HasPrefix(text, "/stats") {
 			return ts.handleStats(ctx, entities, update)
-		} else if text == "/restart" {
-			return ts.handleRestart(ctx, entities, update)
-		} else if text == "/cancel-all" {
-			return ts.handleCancelAll(ctx, entities, update)
-		} else if strings.HasPrefix(text, "/cancel") {
-			return ts.handleCancel(ctx, entities, update, msg, text)
-		} else if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m") {
-			return ts.handleMirror(ctx, entities, update, msg, text, senderID)
-		} else if strings.HasPrefix(text, "/leech") {
-			return ts.handleLeech(ctx, entities, update, msg, text, senderID)
+		}
+
+		if strings.HasPrefix(text, "/status") {
+			return ts.handleStatus(ctx, entities, update)
+		}
+
+		if strings.HasPrefix(text, "/cancel") {
+			return ts.handleCancel(ctx, entities, update, text)
+		}
+
+		if strings.HasPrefix(text, "/mirror") {
+			return ts.handleMirror(ctx, entities, update, msg, text, userID)
+		}
+
+		if strings.HasPrefix(text, "/leech") {
+			return ts.handleLeech(ctx, entities, update, msg, text, userID)
 		}
 
 		return nil
 	})
 }
 
-func (ts *TelegramService) handleStart(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-	opts := []styling.StyledTextOption{
-		styling.Bold("⚡ Zenith-Mirror Bot"),
-		styling.Plain("\n\n"),
-		styling.Bold("Available Commands:"),
-		styling.Plain("\n"),
-		styling.Plain("• `/mirror` or `/m [-i count]` (Reply to media to upload to Google Drive)\n"),
-		styling.Plain("• `/leech <url>` (Download direct link to Telegram)\n"),
-		styling.Plain("• `/status` (Check active jobs & queue)\n"),
-		styling.Plain("• `/stats` (View system & bot statistics)\n"),
-		styling.Plain("• `/cancel <job_id>` (Cancel specific transfer)\n"),
-		styling.Plain("• `/cancel-all` (Cancel all transfers and flush queue)\n"),
-		styling.Plain("• `/restart` (Restart bot service)"),
+func (ts *TelegramService) getUserID(msg *tg.Message) int64 {
+	if msg.FromID != nil {
+		if peerUser, ok := msg.FromID.(*tg.PeerUser); ok {
+			return peerUser.UserID
+		}
 	}
-	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
-	return err
+	return 0
 }
 
-func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-	_, _ = ts.sender.Reply(entities, update).Text(ctx, "🔄 Restarting Zenith-Mirror...")
-	go func() {
-		time.Sleep(1 * time.Second)
-		slog.Info("restarting process via /restart command")
-		os.Exit(0)
-	}()
-	return nil
+func (ts *TelegramService) isAuthorized(userID int64) bool {
+	if len(ts.cfg.AuthorizedUsers) == 0 {
+		return true
+	}
+	for _, id := range ts.cfg.AuthorizedUsers {
+		if id == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, text string) error {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
+		return err
+	}
+	jobID := parts[1]
+	if ts.jm.CancelJob(jobID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
+		return err
+	}
+	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
+	return err
 }
 
 func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 	botUptime := formatDuration(time.Since(ts.startTime))
 
 	osUptimeStr := "N/A"
-	if hostInfo, err := host.Info(); err == nil {
-		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
+	if uptime, err := host.Uptime(); err == nil {
+		osUptimeStr = formatDuration(time.Duration(uptime) * time.Second)
 	}
 
-	totalDisk, usedDisk, freeDisk, diskPercent := "N/A", "N/A", "N/A", 0.0
-	if d, err := disk.Usage("/"); err == nil {
-		totalDisk = FormatBytes(int64(d.Total))
-		usedDisk = FormatBytes(int64(d.Used))
-		freeDisk = FormatBytes(int64(d.Free))
-		diskPercent = d.UsedPercent
+	totalDisk, usedDisk, freeDisk := "N/A", "N/A", "N/A"
+	diskPercent := 0.0
+	if usage, err := disk.Usage("/"); err == nil {
+		totalDisk = FormatBytes(int64(usage.Total))
+		usedDisk = FormatBytes(int64(usage.Used))
+		freeDisk = FormatBytes(int64(usage.Free))
+		diskPercent = usage.UsedPercent
 	}
 
 	netSent, netRecv := "N/A", "N/A"
-	if ioCounters, err := netstat.IOCounters(false); err == nil && len(ioCounters) > 0 {
-		netSent = FormatBytes(int64(ioCounters[0].BytesSent))
-		netRecv = FormatBytes(int64(ioCounters[0].BytesRecv))
+	if counters, err := net.IOCounters(false); err == nil && len(counters) > 0 {
+		netSent = FormatBytes(int64(counters[0].BytesSent))
+		netRecv = FormatBytes(int64(counters[0].BytesRecv))
 	}
 
 	cpuPercent := 0.0
@@ -232,17 +175,14 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 		cpuPercent = percents[0]
 	}
 
-	physCores := runtime.NumCPU()
-	totalCores := runtime.NumCPU()
-	if counts, err := cpu.Counts(false); err == nil && counts > 0 {
-		physCores = counts
-	}
-	if counts, err := cpu.Counts(true); err == nil && counts > 0 {
-		totalCores = counts
-	}
+	physCores, _ := cpu.Counts(false)
+	totalCores, _ := cpu.Counts(true)
 
-	memTotal, memFree, memUsed, memPercent := "N/A", "N/A", "N/A", 0.0
-	swapTotal, swapUsed, swapPercent := "N/A", "N/A", 0.0
+	memTotal, memFree, memUsed := "N/A", "N/A", "N/A"
+	memPercent := 0.0
+	swapTotal, swapUsed := "N/A", "N/A"
+	swapPercent := 0.0
+
 	if v, err := mem.VirtualMemory(); err == nil {
 		memTotal = FormatBytes(int64(v.Total))
 		memFree = FormatBytes(int64(v.Free))
@@ -334,7 +274,7 @@ func (ts *TelegramService) clearLastStatusIf(id int) {
 	ts.lastStatusMu.Unlock()
 }
 
-func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
+func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 	ts.deleteLastStatus()
 	opts := ts.buildStatusStyledText()
 	updates, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
@@ -399,151 +339,109 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 		cpuPercent = percents[0]
 	}
 
-	freeDisk := "N/A"
-	if d, err := disk.Usage("/"); err == nil {
-		freeDisk = FormatBytes(int64(d.Free))
-	}
-
 	memPercent := 0.0
 	if v, err := mem.VirtualMemory(); err == nil {
 		memPercent = v.UsedPercent
 	}
 
-	osUptimeStr := "N/A"
-	if hostInfo, err := host.Info(); err == nil {
-		osUptimeStr = formatDuration(time.Duration(hostInfo.Uptime) * time.Second)
+	diskPercent := 0.0
+	if usage, err := disk.Usage("/"); err == nil {
+		diskPercent = usage.UsedPercent
 	}
 
-	var totalDLSpeed, totalULSpeed float64
-	for _, j := range jobs {
-		if j.State == StateQueued {
-			continue
-		}
-		if j.Phase == PhaseDownloading {
-			totalDLSpeed += j.Speed
-		} else {
-			totalULSpeed += j.Speed
-		}
-	}
-
-	options = append(options, styling.Plain("\n"))
-	options = append(options, styling.Bold("Total DL:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %s/s | ", FormatBytes(int64(totalDLSpeed)))))
-	options = append(options, styling.Bold("Total UL:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %s/s\n", FormatBytes(int64(totalULSpeed)))))
-
-	options = append(options, styling.Bold("CPU:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %.1f%% | ", cpuPercent)))
-	options = append(options, styling.Bold("FREE:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %s\n", freeDisk)))
-	options = append(options, styling.Bold("RAM:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %.1f%% | ", memPercent)))
-	options = append(options, styling.Bold("UPTIME:"))
-	options = append(options, styling.Plain(fmt.Sprintf(" %s", osUptimeStr)))
+	options = append(options, styling.Bold("CPU:"), styling.Plain(fmt.Sprintf(" %.1f%% | ", cpuPercent)))
+	options = append(options, styling.Bold("RAM:"), styling.Plain(fmt.Sprintf(" %.1f%% | ", memPercent)))
+	options = append(options, styling.Bold("DISK:"), styling.Plain(fmt.Sprintf(" %.1f%%", diskPercent)))
 
 	return options
+}
+
+func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, userMsg *tg.Message) {
+	ts.deleteLastStatus()
+
+	opts := ts.buildStatusStyledText()
+	updates, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	if err != nil {
+		slog.Error("failed sending initial live status message", "error", err)
+		return
+	}
+
+	msgID := extractMsgIDFromUpdates(updates)
+	if msgID <= 0 {
+		slog.Warn("could not extract message ID for live status update")
+		return
+	}
+
+	statusCtx, cancel := context.WithCancel(ctx)
+	ts.setLastStatus(msgID, cancel)
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID)
+
+	for {
+		select {
+		case <-statusCtx.Done():
+			ts.clearLastStatusIf(msgID)
+			return
+		case <-ticker.C:
+			activeJobs := ts.jm.GetActiveJobs()
+			if len(activeJobs) == 0 {
+				ts.deleteLastStatus()
+				return
+			}
+
+			newOpts := ts.buildStatusStyledText()
+			peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
+
+			_, editErr := ts.sender.To(peer).Edit(msgID).StyledText(statusCtx, newOpts...)
+			if editErr != nil {
+				slog.Error("failed updating status message", "msg_id", msgID, "error", editErr)
+			}
+		}
+	}
+}
+
+func (ts *TelegramService) buildInputPeer(peer tg.PeerClass, channelID int64, accessHash int64) tg.InputPeerClass {
+	switch p := peer.(type) {
+	case *tg.PeerUser:
+		return &tg.InputPeerUser{UserID: p.UserID}
+	case *tg.PeerChat:
+		return &tg.InputPeerChat{ChatID: p.ChatID}
+	case *tg.PeerChannel:
+		return &tg.InputPeerChannel{ChannelID: p.ChannelID, AccessHash: accessHash}
+	default:
+		return &tg.InputPeerSelf{}
+	}
+}
+
+func extractPeerChannelInfo(peer tg.PeerClass) (int64, int64) {
+	if p, ok := peer.(*tg.PeerChannel); ok {
+		return p.ChannelID, 0
+	}
+	return 0, 0
 }
 
 func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
 	switch u := updates.(type) {
 	case *tg.Updates:
-		for _, up := range u.GetUpdates() {
-			switch unm := up.(type) {
-			case *tg.UpdateNewMessage:
-				if m, ok := unm.Message.(*tg.Message); ok {
-					return m.ID
-				}
-			case *tg.UpdateNewChannelMessage:
-				if m, ok := unm.Message.(*tg.Message); ok {
-					return m.ID
+		for _, update := range u.Updates {
+			if newMsg, ok := update.(*tg.UpdateNewMessage); ok {
+				if msg, ok := newMsg.Message.(*tg.Message); ok {
+					return msg.ID
 				}
 			}
 		}
-	case *tg.UpdateShortMessage:
-		return u.ID
 	case *tg.UpdateShortSentMessage:
 		return u.ID
 	}
 	return 0
 }
 
-func (ts *TelegramService) startLiveStatusUpdater(jobCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) {
-	ts.deleteLastStatus()
-
-	statusCtx, statusCancel := context.WithCancel(jobCtx)
-
-	delay := ts.cfg.StatusRefreshDelay
-	if delay <= 0 {
-		delay = 5
-	}
-	ticker := time.NewTicker(time.Duration(delay) * time.Second)
-	defer ticker.Stop()
-
-	initialOpts := ts.buildStatusStyledText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(statusCtx, initialOpts...)
-	if err != nil {
-		slog.Error("failed sending live status message", "error", err)
-		statusCancel()
-		return
-	}
-
-	statusMsgID := extractMsgIDFromUpdates(updates)
-	ts.setLastStatus(statusMsgID, statusCancel)
-	slog.Info("created live status message", "status_msg_id", statusMsgID)
-
-	for {
-		select {
-		case <-statusCtx.Done():
-			ts.clearLastStatusIf(statusMsgID)
-			if statusMsgID > 0 {
-				slog.Info("deleting completed job live status message", "status_msg_id", statusMsgID)
-				_, delErr := ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
-					Revoke: true,
-					ID:     []int{statusMsgID},
-				})
-				if delErr != nil {
-					slog.Error("failed to delete live status message", "status_msg_id", statusMsgID, "error", delErr)
-				}
-			}
-			return
-		case <-ticker.C:
-			currentOpts := ts.buildStatusStyledText()
-			if statusMsgID > 0 {
-				slog.Info("editing live status message", "status_msg_id", statusMsgID)
-				_, editErr := ts.sender.Reply(entities, update).Edit(statusMsgID).StyledText(statusCtx, currentOpts...)
-				if editErr != nil {
-					slog.Error("failed editing live status message", "status_msg_id", statusMsgID, "error", editErr)
-				}
-			}
-		}
-	}
-}
-
-func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string) error {
-	parts := strings.Fields(text)
-	if len(parts) < 2 {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
-		return err
-	}
-	jobID := parts[1]
-	if ts.jm.CancelJob(jobID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled job %s.", jobID))
-		return err
-	}
-	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found.", jobID))
-	return err
-}
-
-func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-	count := ts.jm.CancelAllJobs()
-	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled all %d active and queued jobs.", count))
-	return err
-}
-
 func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
 	parts := strings.Fields(text)
 
-	// Check if a direct URL was passed: /mirror <url> or /m <url>
 	var rawURL string
 	for _, part := range parts[1:] {
 		if strings.HasPrefix(part, "http://") || strings.HasPrefix(part, "https://") {
@@ -655,7 +553,6 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	// Start a single live status updater for the entire batch
 	statusCtx, statusCancel := context.WithCancel(ctx)
 	go func() {
 		for {
@@ -793,7 +690,6 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
 }
 
-// executeMirrorStream: zero-disk pipe streaming (download + upload simultaneously)
 func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLocationClass) (string, error) {
 	pr, pw := io.Pipe()
 
@@ -820,8 +716,6 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 	return ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 }
 
-// atomicWriteAt wraps io.WriterAt with a single atomic counter for progress tracking.
-// Minimal overhead — no callbacks, no time checks per write.
 type atomicWriteAt struct {
 	file    *os.File
 	written int64
@@ -839,15 +733,13 @@ func (a *atomicWriteAt) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// progressWriterAt wraps an io.WriterAt to track total bytes written (for parallel downloads)
-// Uses atomic ops instead of mutex to avoid contention across threads.
 type progressWriterAt struct {
 	dest       io.WriterAt
 	totalBytes int64
 	written    int64
 	startTime  time.Time
 	onProgress func(read, total int64, speed float64, eta time.Duration)
-	lastNotify int64 // unix nano, atomic
+	lastNotify int64
 }
 
 func newProgressWriterAt(dest io.WriterAt, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *progressWriterAt {
@@ -880,7 +772,6 @@ func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-// executeMirrorParallel: multi-threaded download to temp file, then stream to GDrive
 func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFileLocationClass) (string, error) {
 	tmpFile, err := os.CreateTemp("", "zenith-dl-*")
 	if err != nil {
@@ -892,15 +783,20 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	threads := ts.cfg.DownloadThreads
 	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", threads, "tmp", tmpFile.Name())
 
-	// Raw parallel download — bypass gotd/td's downloader entirely
-	// Each goroutine independently calls UploadGetFile with its own offset.
-	// FILE_MIGRATE handled per-call → multiple goroutines → multiple connections to remote DC.
 	ctx, cancel := context.WithCancel(job.Ctx)
 	defer cancel()
 
 	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
-	err = rawParallelDownload(ctx, ts.client.API(), location, job.Size, threads, tmpFile)
+	invoker, poolCloser, err := createDownloadPool(ctx, ts.client, location, int64(threads))
+	if err != nil {
+		cancel()
+		return "", fmt.Errorf("create download pool: %w", err)
+	}
+	defer poolCloser.Close()
+
+	api := tg.NewClient(invoker)
+	err = rawParallelDownload(ctx, api, location, job.Size, threads, tmpFile)
 
 	cancel()
 
@@ -911,7 +807,6 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	downloadedSize, _ := tmpFile.Seek(0, io.SeekEnd)
 	slog.Info("parallel download finished", "job_id", job.ID, "bytes", downloadedSize)
 
-	// Seek back to start for upload
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
 		return "", fmt.Errorf("failed to seek temp file: %w", err)
 	}
@@ -922,7 +817,6 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Google Drive"
 
-	// Stream temp file into GDrive with progress tracking
 	progressReader := NewProgressReader(tmpFile, downloadedSize, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
 		job.Speed = speed
@@ -954,9 +848,7 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
-
 	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
-
 	return nil
 }
 
@@ -965,80 +857,89 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 
 	slog.Info("executing leech job", "job_id", job.ID, "url", rawURL)
 	job.Phase = PhaseDownloading
-	job.Status = "Downloading from HTTP"
+	job.Status = "Downloading HTTP link"
 
-	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
+	body, contentLength, fileName, err := ts.downloader.DownloadHTTP(job.Ctx, rawURL, nil)
 	if err != nil {
-		slog.Error("invalid url for leech", "job_id", job.ID, "error", err)
+		slog.Error("leech download failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
 		return
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
+	defer body.Close()
 
-	client := &http.Client{Timeout: 0}
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Error("leech download request failed", "job_id", job.ID, "error", err)
-		job.Status = fmt.Sprintf("Failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+	job.FileName = fileName
+	job.Size = contentLength
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Error("leech download non-200 status", "job_id", job.ID, "status", resp.Status)
-		job.Status = fmt.Sprintf("HTTP Error %s", resp.Status)
-		return
-	}
-
-	job.Size = resp.ContentLength
-	urlParts := strings.Split(rawURL, "/")
-	job.FileName = urlParts[len(urlParts)-1]
-	if job.FileName == "" {
-		job.FileName = "downloaded_file.bin"
-	}
-
-	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
+	progressReader := NewProgressReader(body, contentLength, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
 		job.Speed = speed
 		job.ETA = eta
 	})
 
-	slog.Info("uploading stream to telegram", "job_id", job.ID, "size", FormatBytes(job.Size))
+	uploader := ts.client.API()
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Telegram"
 
-	uploadedFile, err := ts.uploader.FromReader(job.Ctx, job.FileName, pr)
-	if err != nil {
-		slog.Error("telegram upload failed", "job_id", job.ID, "error", err)
-		job.Status = fmt.Sprintf("Upload Failed: %v", err)
-		return
+	var uploadErr error
+	if ts.cfg.DownloadMode == "parallel" && contentLength > 0 {
+		_, uploadErr = ts.executeLeechParallel(job, uploader, progressReader, fileName, contentLength)
+	} else {
+		_, uploadErr = ts.executeLeechStream(job, uploader, progressReader, fileName, contentLength)
 	}
 
-	document := message.UploadedDocument(uploadedFile).Filename(job.FileName)
-	if _, err := ts.sender.Reply(entities, update).Media(job.Ctx, document); err != nil {
-		slog.Error("failed sending media message", "job_id", job.ID, "error", err)
+	if uploadErr != nil {
+		slog.Error("leech upload failed", "job_id", job.ID, "error", uploadErr)
+		job.Status = fmt.Sprintf("Failed: %v", uploadErr)
 		return
 	}
 
 	job.Status = "Completed"
-	slog.Info("leech job completed successfully", "job_id", job.ID)
+	slog.Info("leech job completed", "job_id", job.ID)
 }
 
-func (ts *TelegramService) Run(ctx context.Context, handler func(ctx context.Context) error) error {
-	slog.Info("starting Telegram MTProto client session with UpdateHandler")
-	return ts.client.Run(ctx, func(ctx context.Context) error {
-		if ts.cfg.BotToken != "" {
-			status, err := ts.client.Auth().Status(ctx)
-			if err != nil {
-				return fmt.Errorf("failed auth status: %w", err)
-			}
-			if !status.Authorized {
-				slog.Info("logging in via bot token")
-				if _, err := ts.client.Auth().Bot(ctx, ts.cfg.BotToken); err != nil {
-					return fmt.Errorf("failed bot auth: %w", err)
-				}
-			}
-		}
-		return handler(ctx)
+func (ts *TelegramService) executeLeechStream(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
+	u := telegram.NewUploader(api)
+	return u.FromReader(job.Ctx, fileName, reader)
+}
+
+func (ts *TelegramService) executeLeechParallel(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
+	u := telegram.NewUploader(api).WithThreads(ts.cfg.DownloadThreads)
+	return u.FromReader(job.Ctx, fileName, reader)
+}
+
+func (ts *TelegramService) executeURLMirrorStreamFallback(job *Job, rawURL string) (string, error) {
+	body, contentLength, fileName, err := ts.downloader.DownloadHTTP(job.Ctx, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+
+	if job.FileName == "" || job.FileName == "downloaded_file.bin" {
+		job.FileName = fileName
+	}
+	job.Size = contentLength
+
+	progressReader := NewProgressReader(body, contentLength, func(read, total int64, speed float64, eta time.Duration) {
+		job.ReadBytes = read
+		job.Speed = speed
+		job.ETA = eta
 	})
+
+	return ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, contentLength)
+}
+
+func (ts *TelegramService) executeURLMirrorParallel(job *Job, rawURL string) (string, error) {
+	return ts.executeURLMirrorStreamFallback(job, rawURL)
+}
+
+func extractFileNameFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "downloaded_file.bin"
+	}
+	parts := strings.Split(u.Path, "/")
+	if len(parts) > 0 && parts[len(parts)-1] != "" {
+		return parts[len(parts)-1]
+	}
+	return "downloaded_file.bin"
 }

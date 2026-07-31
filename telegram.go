@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/url"
 	"os"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/message/markup"
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -628,6 +630,48 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	return nil
 }
 
+// sendMirrorCompletion sends the completion message with Name/Size/Type and a copy button for the index link.
+func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, job *Job, driveURL string) {
+	baseURL := ts.cfg.IndexBaseURL
+	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
+	indexURL := baseURL + url.PathEscape(job.FileName)
+
+	// Detect MIME type from filename
+	mimeType := "unknown"
+	if idx := strings.LastIndex(job.FileName, "."); idx >= 0 {
+		ext := job.FileName[idx:]
+		if t := mime.TypeByExtension(ext); t != "" {
+			mimeType = t
+		}
+	}
+
+	completionOpts := []styling.StyledTextOption{
+		styling.Bold("Name: "), styling.Plain(job.FileName), styling.Plain("\n"),
+		styling.Bold("Size: "), styling.Plain(FormatBytes(job.Size)), styling.Plain("\n"),
+		styling.Bold("Type: "), styling.Plain(mimeType),
+	}
+
+	// Build reply with inline keyboard if we have an index URL
+	var replyMarkup tg.ReplyMarkupClass
+	if indexURL != "" {
+		copyBtn := &tg.KeyboardButtonCopy{
+			Text:     "Index Link",
+			CopyText: indexURL,
+		}
+		replyMarkup = markup.InlineKeyboard(
+			tg.KeyboardButtonRow{Buttons: []tg.KeyboardButtonClass{copyBtn}},
+		)
+	}
+
+	msg := ts.sender.Reply(entities, update)
+	if replyMarkup != nil {
+		msg = msg.Markup(replyMarkup)
+	}
+	_, _ = msg.StyledText(ctx, completionOpts...)
+}
+
 func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLocationClass, error) {
 	switch m := media.(type) {
 	case *tg.MessageMediaDocument:
@@ -690,22 +734,7 @@ func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities
 	job.Status = "Completed"
 	slog.Info("URL mirror job completed", "job_id", job.ID, "drive_url", driveURL)
 
-	baseURL := ts.cfg.IndexBaseURL
-	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
-		baseURL += "/"
-	}
-	indexURL := baseURL + url.PathEscape(job.FileName)
-
-	completionOpts := []styling.StyledTextOption{
-		styling.Bold("✅ Mirror Complete!\n\n"),
-		styling.Bold("File:"), styling.Plain(" "), styling.Code(job.FileName), styling.Plain("\n"),
-		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s\n", driveURL)),
-	}
-	if ts.cfg.IndexBaseURL != "" {
-		completionOpts = append(completionOpts, styling.Bold("Index Link:"), styling.Plain(fmt.Sprintf(" %s", indexURL)))
-	}
-
-	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
+	ts.sendMirrorCompletion(context.Background(), entities, update, job, driveURL)
 }
 
 func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
@@ -732,22 +761,7 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	job.Status = "Completed"
 	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
 
-	baseURL := ts.cfg.IndexBaseURL
-	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
-		baseURL += "/"
-	}
-	indexURL := baseURL + url.PathEscape(job.FileName)
-
-	completionOpts := []styling.StyledTextOption{
-		styling.Bold("✅ Mirror Complete!\n\n"),
-		styling.Bold("File:"), styling.Plain(" "), styling.Code(job.FileName), styling.Plain("\n"),
-		styling.Bold("Google Drive Link:"), styling.Plain(fmt.Sprintf(" %s\n", driveURL)),
-	}
-	if ts.cfg.IndexBaseURL != "" {
-		completionOpts = append(completionOpts, styling.Bold("Index Link:"), styling.Plain(fmt.Sprintf(" %s", indexURL)))
-	}
-
-	_, _ = ts.sender.Reply(entities, update).StyledText(context.Background(), completionOpts...)
+	ts.sendMirrorCompletion(context.Background(), entities, update, job, driveURL)
 }
 
 func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLocationClass) (string, error) {

@@ -18,6 +18,7 @@ import (
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
@@ -99,6 +100,10 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 			return ts.handleCancel(ctx, entities, update, text)
 		}
 
+		if strings.HasPrefix(text, "/cancelall") {
+			return ts.handleCancelAll(ctx, entities, update)
+		}
+
 		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
 			return ts.handleMirror(ctx, entities, update, msg, text, userID)
 		}
@@ -144,6 +149,12 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 		return err
 	}
 	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
+	return err
+}
+
+func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	cancelled := ts.jm.CancelAllJobs()
+	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled %d job(s).", cancelled))
 	return err
 }
 
@@ -375,7 +386,8 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	statusCtx, cancel := context.WithCancel(ctx)
 	ts.setLastStatus(msgID, cancel)
 
-	ticker := time.NewTicker(2 * time.Second)
+	statusDelay := 3 * time.Second
+	ticker := time.NewTicker(statusDelay)
 	defer ticker.Stop()
 
 	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID)
@@ -397,7 +409,18 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 
 			_, editErr := ts.sender.To(peer).Edit(msgID).StyledText(statusCtx, newOpts...)
 			if editErr != nil {
+				// Back off on FLOOD_WAIT
+				if d, ok := tgerr.AsFloodWait(editErr); ok {
+					statusDelay = d + time.Second
+					ticker.Reset(statusDelay)
+				}
 				slog.Error("failed updating status message", "msg_id", msgID, "error", editErr)
+			} else {
+				// Reset delay on success
+				if statusDelay != 3*time.Second {
+					statusDelay = 3 * time.Second
+					ticker.Reset(statusDelay)
+				}
 			}
 		}
 	}

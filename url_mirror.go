@@ -14,9 +14,10 @@ import (
 
 // executeURLMirrorParallel: multi-threaded HTTP range download to temp file, then stream to GDrive
 func (ts *TelegramService) executeURLMirrorParallel(job *Job, rawURL string) (string, error) {
-	// HEAD request to get size and check Range support
 	client := &http.Client{Timeout: 30 * time.Second}
- headReq, err := http.NewRequestWithContext(job.Ctx, "HEAD", rawURL, nil)
+
+	// HEAD request to get size
+	headReq, err := http.NewRequestWithContext(job.Ctx, "HEAD", rawURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("HEAD request failed: %w", err)
 	}
@@ -29,9 +30,34 @@ func (ts *TelegramService) executeURLMirrorParallel(job *Job, rawURL string) (st
 	headResp.Body.Close()
 
 	totalSize := headResp.ContentLength
-	supportsRange := strings.Contains(strings.ToLower(headResp.Header.Get("Accept-Ranges")), "bytes")
 
-	if totalSize <= 0 || !supportsRange {
+	// Check Content-Disposition for real filename
+	if cd := headResp.Header.Get("Content-Disposition"); cd != "" {
+		if name := extractFilenameFromDisposition(cd); name != "" {
+			job.FileName = name
+		}
+	}
+
+	// Test actual range support with a small GET request
+	if totalSize <= 0 {
+		slog.Info("could not determine file size, falling back to stream mode", "job_id", job.ID)
+		return ts.executeURLMirrorStreamFallback(job, rawURL)
+	}
+
+	supportsRange := false
+	testReq, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
+	if err == nil {
+		testReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
+		testReq.Header.Set("Range", "bytes=0-0")
+		testResp, err := client.Do(testReq)
+		if err == nil {
+			testResp.Body.Close()
+			// 206 Partial Content = range supported
+			supportsRange = testResp.StatusCode == http.StatusPartialContent
+		}
+	}
+
+	if !supportsRange {
 		slog.Info("server does not support range requests, falling back to stream mode", "job_id", job.ID)
 		return ts.executeURLMirrorStreamFallback(job, rawURL)
 	}
@@ -191,6 +217,25 @@ func extractFileNameFromURL(rawURL string) string {
 	// Strip query params
 	if idx := strings.IndexByte(name, '?'); idx >= 0 {
 		name = name[:idx]
+	}
+	return name
+}
+
+func extractFilenameFromDisposition(cd string) string {
+	// Parse: attachment; filename="file.mkv" or attachment; filename=file.mkv
+	idx := strings.Index(cd, "filename=")
+	if idx < 0 {
+		return ""
+	}
+	name := cd[idx+len("filename="):]
+	name = strings.Trim(name, "\"' ")
+	// Stop at semicolon or end
+	if semi := strings.IndexByte(name, ';'); semi >= 0 {
+		name = name[:semi]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
 	}
 	return name
 }

@@ -834,7 +834,16 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 
 	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
+	// Try to create multi-connection pool to remote DC for faster downloads
 	api := ts.client.API()
+	invoker, poolCloser, poolErr := createDownloadPool(ctx, ts.client, location, int64(threads))
+	if poolErr != nil {
+		slog.Warn("pool creation failed, using single connection", "error", poolErr)
+	} else {
+		api = tg.NewClient(invoker)
+		defer poolCloser.Close()
+	}
+
 	err = rawParallelDownload(ctx, api, location, job.Size, threads, tmpFile)
 
 	cancel()

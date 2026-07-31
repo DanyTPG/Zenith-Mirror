@@ -892,32 +892,17 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	threads := ts.cfg.DownloadThreads
 	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", threads, "tmp", tmpFile.Name())
 
-	// Wrap temp file with byte counter for progress tracking
-	counter := &atomicWriteAt{file: tmpFile}
+	// Raw parallel download — bypass gotd/td's downloader entirely
+	// Each goroutine independently calls UploadGetFile with its own offset.
+	// FILE_MIGRATE handled per-call → multiple goroutines → multiple connections to remote DC.
+	ctx, cancel := context.WithCancel(job.Ctx)
+	defer cancel()
 
-	// Progress tracking goroutine
-	stopProgress := startProgressTracker(job, counter)
-	defer stopProgress()
+	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
-	// Create multi-connection pool to the correct DC
-	pool, poolCloser, err := createDownloadPool(job.Ctx, ts.client, location, int64(threads))
-	if err != nil {
-		slog.Warn("failed to create connection pool, falling back to single connection", "error", err)
-		_, err = ts.downloader.Download(ts.client.API(), location).
-			WithThreads(threads).
-			WithVerify(false).
-			Parallel(job.Ctx, counter)
-	} else {
-		defer poolCloser.Close()
-		poolAPI := tg.NewClient(pool)
-		dl := downloader.NewDownloader().
-			WithPartSize(512 * 1024).
-			WithAllowCDN(true)
-		_, err = dl.Download(poolAPI, location).
-			WithThreads(threads).
-			WithVerify(false).
-			Parallel(job.Ctx, counter)
-	}
+	err = rawParallelDownload(ctx, ts.client.API(), location, job.Size, threads, tmpFile)
+
+	cancel()
 
 	if err != nil {
 		return "", fmt.Errorf("parallel download failed: %w", err)

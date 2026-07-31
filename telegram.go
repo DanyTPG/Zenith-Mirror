@@ -646,13 +646,25 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		jobRef = job
 
 		queuedJobs++
-		go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
 	}
 
 	if queuedJobs == 0 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "No downloadable media files found in the requested range.")
 		return err
 	}
+
+	// Start a single live status updater for the entire batch
+	statusCtx, statusCancel := context.WithCancel(ctx)
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			if ts.jm.GetActiveJobCount() == 0 {
+				statusCancel()
+				return
+			}
+		}
+	}()
+	go ts.startLiveStatusUpdater(statusCtx, entities, update, msg)
 
 	return nil
 }

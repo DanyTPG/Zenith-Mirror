@@ -710,50 +710,19 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities tg.Entities, update *tg.UpdateNewMessage) {
 	defer ts.jm.FinishJob(job.ID)
 
-	slog.Info("executing URL mirror job", "job_id", job.ID, "url", rawURL)
+	slog.Info("executing URL mirror job", "job_id", job.ID, "url", rawURL, "mode", ts.cfg.DownloadMode)
 	job.Phase = PhaseDownloading
 	job.Status = "Downloading from HTTP URL"
+	job.FileName = extractFileNameFromURL(rawURL)
 
-	req, err := http.NewRequestWithContext(job.Ctx, "GET", rawURL, nil)
-	if err != nil {
-		slog.Error("invalid URL for mirror", "job_id", job.ID, "error", err)
-		job.Status = fmt.Sprintf("Failed: %v", err)
-		return
+	var driveURL string
+	var err error
+
+	if ts.cfg.DownloadMode == "parallel" {
+		driveURL, err = ts.executeURLMirrorParallel(job, rawURL)
+	} else {
+		driveURL, err = ts.executeURLMirrorStreamFallback(job, rawURL)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zenith-Mirror/1.0")
-
-	client := &http.Client{Timeout: 0}
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Error("URL download request failed", "job_id", job.ID, "error", err)
-		job.Status = fmt.Sprintf("Failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Error("URL download non-200 status", "job_id", job.ID, "status", resp.Status)
-		job.Status = fmt.Sprintf("HTTP Error %s", resp.Status)
-		return
-	}
-
-	job.Size = resp.ContentLength
-	urlParts := strings.Split(rawURL, "/")
-	job.FileName = urlParts[len(urlParts)-1]
-	if job.FileName == "" {
-		job.FileName = "downloaded_file.bin"
-	}
-
-	pr := NewProgressReader(resp.Body, job.Size, func(read, total int64, speed float64, eta time.Duration) {
-		job.ReadBytes = read
-		job.Speed = speed
-		job.ETA = eta
-	})
-
-	job.Phase = PhaseUploading
-	job.Status = "Uploading to Google Drive"
-
-	driveURL, err := ts.gdrive.UploadStream(job.Ctx, job.FileName, pr, job.Size)
 	if err != nil {
 		slog.Error("gdrive upload failed for URL mirror", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)

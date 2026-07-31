@@ -895,38 +895,31 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	// Wrap temp file with byte counter for progress tracking
 	counter := &atomicWriteAt{file: tmpFile}
 
-	// Progress tracking goroutine — reads counter once per second
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		start := time.Now()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				written := atomic.LoadInt64(&counter.written)
-				elapsed := time.Since(start).Seconds()
-				if elapsed > 0 {
-					job.ReadBytes = written
-					job.Speed = float64(written) / elapsed
-					if job.Size > 0 {
-						remaining := float64(job.Size-written) / job.Speed
-						job.ETA = time.Duration(remaining * float64(time.Second))
-					}
-				}
-			}
-		}
-	}()
+	// Progress tracking goroutine
+	stopProgress := startProgressTracker(job, counter)
+	defer stopProgress()
 
-	// Use CDN-aware download via client (handles CDN redirects automatically)
-	_, err = ts.client.Download(location).
-		WithThreads(threads).
-		WithVerify(false). // skip hash verification for speed
-		Parallel(job.Ctx, counter)
-
-	close(done)
+	// Create a multi-connection pool — distributes RPCs across N TCP connections
+	pool, err := ts.client.Pool(int64(threads))
+	if err != nil {
+		slog.Warn("failed to create connection pool, falling back to single connection", "error", err)
+		// Fallback to single-connection download
+		_, err = ts.downloader.Download(ts.client.API(), location).
+			WithThreads(threads).
+			WithVerify(false).
+			Parallel(job.Ctx, counter)
+	} else {
+		defer pool.Close()
+		poolAPI := tg.NewClient(pool)
+		// Use CDN-aware download with pooled connections
+		dl := downloader.NewDownloader().
+			WithPartSize(512 * 1024).
+			WithAllowCDN(true)
+		_, err = dl.Download(poolAPI, location).
+			WithThreads(threads).
+			WithVerify(false).
+			Parallel(job.Ctx, counter)
+	}
 
 	if err != nil {
 		return "", fmt.Errorf("parallel download failed: %w", err)

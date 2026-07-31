@@ -54,7 +54,16 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 		if end > size {
 			end = size
 		}
+		// Telegram requires Limit to be a multiple of 4096
 		chunkLen := int(end - offset)
+		if chunkLen%4096 != 0 {
+			// Round down to nearest multiple of 4096, handle remainder later
+			rounded := chunkLen &^ 4095
+			if rounded > 0 {
+				end = offset + int64(rounded)
+				chunkLen = rounded
+			}
+		}
 
 		wg.Add(1)
 		go func(offset int64, chunkLen int, chunkIdx int) {
@@ -75,6 +84,21 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 
 	if err := firstErr.Load(); err != nil {
 		return err.(error)
+	}
+
+	// Handle remainder bytes (when file size not a multiple of 4096)
+	if remainder := size % int64(rawChunkSize); remainder > 0 && remainder%4096 != 0 {
+		if firstErr.Load() == nil {
+			offset := size - remainder
+			rounded := int(remainder) &^ 4095
+			if rounded > 0 {
+				n, err := downloadChunkWithRetry(ctx, api, location, offset, rounded, totalChunks, file)
+				if err != nil {
+					return fmt.Errorf("remainder chunk at offset %d: %w", offset, err)
+				}
+				written.Add(int64(n))
+			}
+		}
 	}
 
 	slog.Info("raw parallel download complete", "bytes", written.Load())

@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
+
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/tg"
 )
 
 func main() {
@@ -36,15 +39,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	tg, err := NewTelegramService(cfg, jm, gdrive)
-	if err != nil {
-		slog.Error("failed to initialize telegram service", "error", err)
-		os.Exit(1)
+	storage := &session.FileStorage{Path: cfg.SessionFile}
+	dispatcher := tg.NewUpdateDispatcher()
+
+	clientOpts := telegram.Options{
+		SessionStorage: storage,
+		UpdateHandler:  dispatcher,
+		AllowCDN:       true,
 	}
+	client := telegram.NewClient(cfg.AppID, cfg.AppHash, clientOpts)
+
+	ts := NewTelegramService(client, gdrive, jm, cfg)
+	ts.RegisterHandlers(dispatcher)
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- tg.Run(ctx, func(ctx context.Context) error {
+		errCh <- client.Run(ctx, func(ctx context.Context) error {
 			slog.Info("Zenith-Mirror bot engine running and listening for commands")
 			<-ctx.Done()
 			return nil
@@ -53,10 +63,8 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		slog.Info("shutdown signal received, cancelling active jobs...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = shutdownCtx
+		slog.Info("shutdown signal received")
+		jm.CancelAllJobs()
 		slog.Info("graceful shutdown complete")
 	case err := <-errCh:
 		if err != nil {

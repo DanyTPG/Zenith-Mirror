@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/tg"
 )
 
 type LeechPipeline struct {
@@ -19,6 +22,11 @@ func NewLeechPipeline(tg *TelegramService) *LeechPipeline {
 		},
 		tg: tg,
 	}
+}
+
+func (lp *LeechPipeline) Download(client *tg.Client, location tg.InputFileLocationClass) *downloader.Builder {
+	dl := downloader.NewDownloader().WithAllowCDN(true)
+	return dl.Download(client, location)
 }
 
 func (lp *LeechPipeline) DownloadHTTP(ctx context.Context, rawURL string, headers map[string]string) (io.ReadCloser, int64, string, error) {

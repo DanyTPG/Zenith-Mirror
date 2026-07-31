@@ -61,6 +61,51 @@ func (pr *ProgressReader) notifyIfNeeded() {
 	pr.onProgress(read, pr.totalBytes, speed, eta)
 }
 
+func FormatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%dm%ds", int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60)
+}
+
+// ProgressWriter wraps an io.Writer with progress tracking.
+type ProgressWriter struct {
+	w          io.Writer
+	totalBytes int64
+	readBytes  int64
+	startTime  time.Time
+	lastNotify time.Time
+	onProgress func(read, total int64, speed float64, eta time.Duration)
+}
+
+func NewProgressWriter(w io.Writer, totalBytes int64, onProgress func(read, total int64, speed float64, eta time.Duration)) *ProgressWriter {
+	return &ProgressWriter{w: w, totalBytes: totalBytes, startTime: time.Now(), onProgress: onProgress}
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	if n > 0 {
+		pw.readBytes += int64(n)
+		now := time.Now()
+		if now.Sub(pw.lastNotify) >= time.Second {
+			pw.lastNotify = now
+			elapsed := now.Sub(pw.startTime).Seconds()
+			if elapsed > 0 && pw.onProgress != nil {
+				speed := float64(pw.readBytes) / elapsed
+				var eta time.Duration
+				if speed > 0 && pw.readBytes < pw.totalBytes {
+					eta = time.Duration(float64(pw.totalBytes-pw.readBytes) / speed * float64(time.Second))
+				}
+				pw.onProgress(pw.readBytes, pw.totalBytes, speed, eta)
+			}
+		}
+	}
+	return n, err
+}
+
 func RenderProgressBar(current, total int64, length int) string {
 	if length <= 0 {
 		length = 12

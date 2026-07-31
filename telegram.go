@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/styling"
+	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -898,12 +898,12 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 }
 
 func (ts *TelegramService) executeLeechStream(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
-	u := telegram.NewUploader(api)
+	u := uploader.NewUploader(api)
 	return u.FromReader(job.Ctx, fileName, reader)
 }
 
 func (ts *TelegramService) executeLeechParallel(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
-	u := telegram.NewUploader(api).WithThreads(ts.cfg.DownloadThreads)
+	u := uploader.NewUploader(api).WithThreads(ts.cfg.DownloadThreads)
 	return u.FromReader(job.Ctx, fileName, reader)
 }
 

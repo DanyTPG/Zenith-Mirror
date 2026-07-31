@@ -20,6 +20,7 @@ type Config struct {
 	DownloadThreads        int     `json:"download_threads"` // threads for parallel mode (default 4)
 	OwnerID                int64   `json:"owner_id"`
 	AllowedUserIDs         []int64 `json:"allowed_user_ids"`
+	AuthorizedUsers        []int64 `json:"authorized_users"` // alias for AllowedUserIDs
 	MaxConcurrency         int     `json:"max_concurrency"`
 	StatusRefreshDelaySec  int     `json:"status_refresh_delay_sec"`
 	StatusRefreshDelay     int     `json:"-"`

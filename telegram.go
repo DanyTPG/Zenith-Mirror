@@ -788,14 +788,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 
 	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
-	invoker, poolCloser, err := createDownloadPool(ctx, ts.client, location, int64(threads))
-	if err != nil {
-		cancel()
-		return "", fmt.Errorf("create download pool: %w", err)
-	}
-	defer poolCloser.Close()
-
-	api := tg.NewClient(invoker)
+	api := ts.client.API()
 	err = rawParallelDownload(ctx, api, location, job.Size, threads, tmpFile)
 
 	cancel()

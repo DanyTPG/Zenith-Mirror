@@ -96,12 +96,12 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 			return ts.handleStatus(ctx, entities, update)
 		}
 
-		if strings.HasPrefix(text, "/cancel") {
-			return ts.handleCancel(ctx, entities, update, text)
-		}
-
 		if strings.HasPrefix(text, "/cancelall") {
 			return ts.handleCancelAll(ctx, entities, update)
+		}
+
+		if strings.HasPrefix(text, "/cancel") {
+			return ts.handleCancel(ctx, entities, update, text)
 		}
 
 		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {

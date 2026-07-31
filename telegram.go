@@ -822,12 +822,18 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 // atomicWriteAt wraps io.WriterAt with a single atomic counter for progress tracking.
 // Minimal overhead — no callbacks, no time checks per write.
 type atomicWriteAt struct {
-	file    io.WriterAt
+	file    *os.File
 	written int64
 }
 
 func (a *atomicWriteAt) WriteAt(p []byte, off int64) (int, error) {
 	n, err := a.file.WriteAt(p, off)
+	atomic.AddInt64(&a.written, int64(n))
+	return n, err
+}
+
+func (a *atomicWriteAt) Write(p []byte) (int, error) {
+	n, err := a.file.Write(p)
 	atomic.AddInt64(&a.written, int64(n))
 	return n, err
 }
@@ -888,8 +894,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	// Wrap temp file with byte counter for progress tracking
 	counter := &atomicWriteAt{file: tmpFile}
 
-	// Write directly to temp file via counter — no progress wrapper overhead
-	// Track progress via a background goroutine
+	// Progress tracking goroutine — reads counter once per second
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -914,11 +919,17 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		}
 	}()
 
-	// Parallel download with many threads — direct WriteAt via counter
-	_, err = ts.downloader.Download(ts.client.API(), location).
-		WithThreads(threads).
-		WithVerify(false). // skip hash verification for speed
-		Parallel(job.Ctx, counter)
+	// Try parallel first, fall back to stream if threads=1
+	if threads > 1 {
+		_, err = ts.downloader.Download(ts.client.API(), location).
+			WithThreads(threads).
+			WithVerify(false).
+			Parallel(job.Ctx, counter)
+	} else {
+		_, err = ts.downloader.Download(ts.client.API(), location).
+			WithVerify(false).
+			Stream(job.Ctx, counter)
+	}
 
 	close(done)
 

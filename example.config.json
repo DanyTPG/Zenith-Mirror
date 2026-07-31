@@ -2,11 +2,15 @@
   "app_id": 123456,
   "app_hash": "YOUR_TELEGRAM_APP_HASH",
   "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
-  "phone_number": "+1234567890",
   "session_file": "session.json",
-  "gdrive_sa_file": "service_account.json",
-  "gdrive_folder_id": "1A2B3C4D5E6F7G8H9I0J",
-  "owner_id": 987654321,
-  "allowed_users": [11223344, 55667788],
-  "max_concurrency": 3
+  "gdrive_credentials_file": "credentials.json",
+  "gdrive_token_file": "gdrive_token.json",
+  "gdrive_folder_id": "YOUR_GOOGLE_DRIVE_FOLDER_ID",
+  "index_base_url": "https://dl.example.com/",
+  "download_mode": "parallel",
+  "download_threads": 16,
+  "owner_id": 123456789,
+  "allowed_user_ids": [987654321],
+  "max_concurrency": 3,
+  "status_refresh_delay_sec": 3
 }

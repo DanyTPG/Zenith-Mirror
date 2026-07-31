@@ -1,6 +1,4 @@
-# Zenith-Mirror Development Plan (Revised)
-
-Changes from the original plan are marked **[NEW]**. Everything else is carried over unchanged.
+# Zenith-Mirror Development Plan
 
 ## Architecture Overview
 
@@ -8,10 +6,11 @@ Changes from the original plan are marked **[NEW]**. Everything else is carried 
               ┌──────────────────────────────────────────────────────┐
               │                    Zenith-Mirror                     │
               │                                                      │
- Telegram ───►│  Command Dispatcher (/mirror, /leech, /status,       │
-              │                      /cancel [NEW])                  │
+ Telegram ───►│  Command Dispatcher                                  │
+              │  /mirror (/m)  /leech  /status  /stats               │
+              │  /cancel <id>  /cancelall  /help                     │
               │            │                                         │
-              │      Auth/ACL Check [NEW] — owner/whitelist gate     │
+              │      Auth/ACL Check — owner/whitelist gate           │
               └───────────────┬────────────────┬───────────────┬─────┘
                               │                │               │
              ┌────────────────▼───┐        ┌───▼────────────────┐    │
@@ -19,108 +18,111 @@ Changes from the original plan are marked **[NEW]**. Everything else is carried 
              └────────┬───────────┘        └───┬────────────────┘    │
                       │                        │                    │
                       ▼                        ▼                    │
-        Telegram MTProto Stream      HTTP Direct Stream              │
-       (`github.com/gotd/td`)        (`net/http` stdlib)             │
-       + FloodWait middleware [NEW]  + UA/Referer, redirects,        │
-                      │              Range-resume [NEW]              │
-                      ▼                        ▼                    │
-             Progress Tracker         Progress Tracker               │
-        (`io.Reader` pipe, chunk-     (`io.Reader` pipe)              │
-         aligned to Drive's 256KiB    │                              │
-         boundary [NEW])              │                              │
-                      │                        │                    │
-                      ▼                        ▼                    │
-             Google Drive API           Telegram Upload              │
-      (resumable session [NEW])     (`github.com/gotd/td`,          │
-       google.golang.org/api        split-upload if >limit [NEW])   │
-                      │                        │                    │
-                      └────────────┬───────────┘                    │
-                                   ▼                                 │
-                    Job Manager: context.Context per job,            │
-                    max concurrency cap, cleanup on exit [NEW]  ◄────┘
+        Telegram MTProto Download       HTTP Direct Download        │
+       ┌─────────────────────────┐     (`net/http` stdlib)          │
+       │ Pool (remote DC) or     │     + Range-resume               │
+       │ Raw Parallel Download   │                                  │
+       │ (bypasses gotd/td mutex)│                                  │
+       └────────┬────────────────┘                                  │
+                │                                                    │
+                ▼                                                    │
+        Progress Tracker (atomic byte counter)                      │
+                │                                                    │
+        ┌───────┴───────┐                                           │
+        │               │                                           │
+        ▼               ▼                                           │
+  Google Drive     Telegram Upload                                  │
+  (OAuth2)        (`uploader.NewUploader`)                          │
+        │               │                                           │
+        └───────┬───────┘                                           │
+                ▼                                                    │
+        Job Manager: FIFO queue, max concurrency cap                │
+        Status Updater: live editing, auto-delete on completion     │
 ```
 
----
+## Current State
 
-## Phase 1: Foundation & Configuration
+### Implemented Features
 
-1. **Dependencies:**
-   - `github.com/gotd/td`: native Go MTProto client (full 2GB+ down/upload support).
-   - `google.golang.org/api/drive/v3`: Google Drive API v3.
-   - **[NEW]** `github.com/gotd/td/telegram/auth/floodwait`: flood-wait middleware.
+1. **Config & Auth**
+   - JSON config with permission enforcement (`0600`)
+   - Bot token authentication (no phone auth needed)
+   - Owner/whitelist ACL gate on all commands
 
-2. **Config Loader:**
-   - Single JSON / `.env` file for API credentials (`APP_ID`, `APP_HASH`, `BOT_TOKEN` or `PHONE_NUMBER`, `GDRIVE_SA_FILE`, `GDRIVE_FOLDER_ID`).
-   - **[NEW]** `OWNER_ID` / `ALLOWED_USER_IDS` — whitelist for who may invoke commands.
-   - **[NEW]** Enforce `0600` permissions on the config and service-account files at startup; refuse to run (or warn loudly) if they're world-readable. Never commit these to the repo.
+2. **Download Engine**
+   - **Raw parallel download**: N goroutines independently call `UploadGetFile()` via `client.API()`, each handling `FILE_MIGRATE` auto-migration. Bypasses gotd/td's `offsetMux` mutex bottleneck → ~11MB/s achieved.
+   - **Pool caching**: `client.DC(ctx, dc, threads)` creates multi-connection pool to remote DC, cached per DC for reuse across batch jobs.
+   - **FLOOD_WAIT handling**: `tgerr.AsFloodWait()` with retry + backoff, max 32 retries.
+   - **Chunk alignment**: Last chunk rounded to multiple of 4096 (Telegram requirement).
+   - **Download modes**: `parallel` (temp file + atomicWriteAt) or `stream` (io.Pipe zero-disk).
 
-3. **[NEW] Session Persistence:**
-   - Since large-file transfers require a logged-in *user* session (not just a bot token), implement first-run phone/code/2FA login and persist the session via `session.FileStorage` (or a small SQLite-backed storage) so the process doesn't need re-auth on every restart.
+3. **Upload**
+   - Google Drive OAuth2 resumable upload
+   - Telegram upload via `uploader.NewUploader` for leech
 
-4. **[NEW] Auth Middleware:**
-   - Wire `floodwait.NewSimpleWaiter()` (or equivalent) into the MTProto client from the start — sustained transfer load will trigger `FLOOD_WAIT_X` errors, and this needs to be handled transparently rather than surfaced as a crash.
+4. **Status & Progress**
+   - Single in-place edited message with `□`/`■` progress bars
+   - Per-job: filename, progress, processed/total, speed, ETA, `/cancel` button
+   - System: Total DL/UL speeds, CPU, RAM, FREE memory, OS uptime
+   - FLOOD_WAIT backoff on status edits
+   - Auto-delete on completion or context cancellation
+   - `lastStatusID`/`lastStatusFn` properly cleared on delete
 
----
+5. **Job Management**
+   - FIFO queue with configurable `max_concurrency`
+   - `/cancel <job_id>` and `/cancelall`
+   - Job context cancellation on cancel
 
-## Phase 2: Live Status & Progress Engine
+6. **Completion Message**
+   - `Name:` (monospace) / `Size:` / `Type:` (MIME detected from extension)
+   - Inline "Index Link" copy-to-clipboard button (`KeyboardButtonCopy`)
 
-1. **Zero-Disk Pipe:**
-   - Implement `ProgressReader` (wraps `io.Reader`) to calculate byte rate, percentage, and ETA dynamically without storing files on local disk.
-   - **[NEW]** Align pipe chunk sizes to Google Drive's resumable-upload requirement (multiples of 256KiB, except the final chunk) so streaming and resumability both work correctly.
+7. **Batch Support**
+   - `/mirror -i N` / `/m -i N`: mirrors N consecutive files from a message
+   - Single status updater for entire batch
+   - Pool reused across all jobs in batch
 
-2. **Task Manager:**
-   - Thread-safe in-memory map tracking active jobs (`sync.Map` or mutex-guarded map).
-   - Throttled Telegram editor (updates status message every 2–3s to prevent Telegram API rate limits); skip redundant edits when content hasn't changed.
-   - **[NEW]** Each job carries a `context.Context` / `context.CancelFunc` pair, enabling both user-initiated `/cancel` and process-wide graceful shutdown (SIGTERM aborts in-flight jobs cleanly instead of leaving orphaned Drive upload sessions).
-   - **[NEW]** Cap maximum concurrent jobs (configurable) to avoid saturating host bandwidth or triggering IP-level flood bans.
-   - **[NEW]** Remove completed/failed/cancelled jobs from the map promptly — an unbounded map is a slow memory leak.
+### Commands
 
----
+| Command | Description |
+|---------|-------------|
+| `/mirror` / `/m` | Mirror Telegram media to Google Drive |
+| `/m <url>` / `/mirror <url>` | Mirror HTTP URL to Google Drive |
+| `/mirror -i N` | Mirror N consecutive files |
+| `/leech <url>` | Download URL → Telegram |
+| `/status` | Current transfer status |
+| `/stats` | System stats |
+| `/cancel <job_id>` | Cancel specific job |
+| `/cancelall` | Cancel all jobs |
+| `/help` | Help message |
 
-## Phase 3: Core Commands
+### Key Technical Decisions
 
-1. **`/mirror` (Telegram ➔ Google Drive):**
-   - Intercept media message or reply.
-   - Open MTProto download stream → pipe directly into GDrive API upload call.
-   - **[NEW]** Use Drive's resumable upload session explicitly (not simple upload), so a dropped connection mid-transfer can resume instead of restarting from byte 0.
-   - Edit status to show final Google Drive shareable link.
+- **Why raw parallel**: gotd/td's downloader serializes all RPCs through `offsetMux` mutex on a single TCP connection. Even 16 goroutines = 1 RPC at a time. Raw `UploadGetFile` from multiple goroutines creates multiple connections → ~11MB/s.
+- **Why pool caching**: `client.DC(ctx, dc, N)` does auth key transfer which fails if done concurrently by multiple jobs. Cache once, reuse.
+- **Why OAuth2**: Google Service Accounts have 0 storage quota.
+- **Why chunk alignment**: Telegram rejects `Limit` not multiple of 4096 with `LIMIT_INVALID`.
 
-2. **`/leech` (URL ➔ Telegram):**
-   - Parse target URL from command `/leech <url>`.
-   - Open HTTP stream → pipe directly into MTProto upload call.
-   - **[NEW]** Set a custom `User-Agent`/`Referer` (many direct-download hosts reject bare requests) and follow redirects with a sane cap.
-   - **[NEW]** Support HTTP `Range` requests to resume a partially-downloaded source file after a dropped connection.
-   - **[NEW]** Split-upload logic for source files exceeding the Telegram upload limit (2GB standard / 4GB Premium) — split into parts or fail with a clear error message rather than silently truncating.
-   - Send uploaded media to chat with final completion stats.
+### Files
 
-3. **`/status`:**
-   - List active jobs with progress from the Task Manager (as originally planned).
+| File | Purpose |
+|------|---------|
+| `main.go` | Entry point, client setup, dispatcher |
+| `config.go` | Config struct, loader, validation |
+| `telegram.go` | Command handlers, status updater, completion messages |
+| `raw_download.go` | Raw parallel downloader (16 goroutines, FLOOD_WAIT handling) |
+| `pool_download.go` | DC detection, multi-connection pool creation |
+| `gdrive.go` | OAuth2, streaming upload to Google Drive |
+| `leech.go` | LeechPipeline, HTTP download |
+| `url_mirror.go` | URL mirror logic, HTTP range support |
+| `progress.go` | FormatBytes, FormatDuration, RenderProgressBar, NewProgressWriter |
+| `job_manager.go` | Job struct, FIFO queue, concurrency control |
+| `pool_download.go` | DC detection, pool creation and caching |
 
-4. **[NEW] `/cancel <job_id>`:**
-   - Cancel an in-flight job via its context; clean up any partial Drive upload session or Telegram upload state.
+### Remaining Work
 
-5. **[NEW] Authorization:**
-   - Gate all commands behind the owner/whitelist check from Phase 1 config — without this, the bot is an open relay for your Drive quota and bandwidth to anyone who finds it.
-
----
-
-## Phase 4: Verification & Build
-
-1. Build static binary (`go build`).
-2. Run self-checks on progress calculations.
-   - **[NEW]** Unit tests specifically for `ProgressReader`'s byte-rate/ETA math (zero-bytes-read first tick, division-by-zero edge cases).
-3. Validate memory usage (<20MB idle).
-4. **[NEW]** Structured logging (`log/slog` stdlib) — needed immediately once flood-wait, quota, or network errors start showing up in real use.
-5. **[NEW]** Dockerfile for containerized deployment, consistent with the rest of the self-hosted stack.
-6. **[NEW]** Graceful shutdown: SIGTERM triggers context cancellation across all active jobs before process exit.
-
----
-
-## Recommended Development Order
-1. Configuration & validation (`config.go`)
-2. Telegram authentication / session persistence
-3. Task manager & cancellation contexts
-4. Progress engine (`ProgressReader` + ETA math + tests)
-5. `/mirror` command (MTProto -> Drive resumable pipe)
-6. `/leech` command (HTTP -> MTProto pipe)
-7. Logging (`log/slog`), graceful shutdown, Dockerfile
+- [ ] Graceful shutdown (SIGTERM → cancel all jobs)
+- [ ] Leech completion message with copy button
+- [ ] Split-upload for files >4GB (Telegram limit)
+- [ ] Resume support for interrupted uploads
+- [ ] Rate limiting for status edits during high concurrency

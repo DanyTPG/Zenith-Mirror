@@ -19,3 +19,4 @@ session.json
 /downloads/
 /tmp/
 *.tmp
+bot.log

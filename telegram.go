@@ -351,18 +351,41 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	}
 
 	memPercent := 0.0
+	var memFree uint64
 	if v, err := mem.VirtualMemory(); err == nil {
 		memPercent = v.UsedPercent
+		memFree = v.Free
 	}
 
 	diskPercent := 0.0
+	_ = diskPercent
 	if usage, err := disk.Usage("/"); err == nil {
 		diskPercent = usage.UsedPercent
 	}
 
+	botUptime := formatDuration(time.Since(ts.startTime))
+	osUptimeStr := botUptime
+	if uptime, err := host.Uptime(); err == nil {
+		osUptimeStr = formatDuration(time.Duration(uptime) * time.Second)
+	}
+
+	// Total DL/UL speeds
+	var totalDL, totalUL float64
+	for _, j := range jobs {
+		if j.State == StateRunning {
+			totalDL += j.Speed
+		}
+	}
+
+	options = append(options, styling.Plain("\n"))
+	options = append(options, styling.Bold("Total DL:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s/s | ", FormatBytes(int64(totalDL)))))
+	options = append(options, styling.Bold("Total UL:"))
+	options = append(options, styling.Plain(fmt.Sprintf(" %s/s\n", FormatBytes(int64(totalUL)))))
 	options = append(options, styling.Bold("CPU:"), styling.Plain(fmt.Sprintf(" %.1f%% | ", cpuPercent)))
+	options = append(options, styling.Bold("FREE:"), styling.Plain(fmt.Sprintf(" %s\n", FormatBytes(int64(memFree)))))
 	options = append(options, styling.Bold("RAM:"), styling.Plain(fmt.Sprintf(" %.1f%% | ", memPercent)))
-	options = append(options, styling.Bold("DISK:"), styling.Plain(fmt.Sprintf(" %.1f%%", diskPercent)))
+	options = append(options, styling.Bold("UPTIME:"), styling.Plain(fmt.Sprintf(" %s", osUptimeStr)))
 
 	return options
 }

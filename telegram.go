@@ -869,19 +869,43 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", ts.cfg.DownloadThreads, "tmp", tmpFile.Name())
+	threads := ts.cfg.DownloadThreads
+	slog.Info("starting parallel telegram download", "job_id", job.ID, "threads", threads, "tmp", tmpFile.Name())
 
-	// Wrap temp file to track download progress
-	pwa := newProgressWriterAt(tmpFile, job.Size, func(read, total int64, speed float64, eta time.Duration) {
-		job.ReadBytes = read
-		job.Speed = speed
-		job.ETA = eta
-	})
+	// Write directly to temp file — no progress wrapper overhead
+	// Track progress via a background goroutine that stats the file
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				pos, _ := tmpFile.Seek(0, io.SeekCurrent)
+				elapsed := time.Since(start).Seconds()
+				if elapsed > 0 {
+					job.ReadBytes = pos
+					job.Speed = float64(pos) / elapsed
+					if job.Size > 0 {
+						remaining := float64(job.Size-pos) / job.Speed
+						job.ETA = time.Duration(remaining * float64(time.Second))
+					}
+				}
+			}
+		}
+	}()
 
-	// Parallel download to temp file with N threads
+	// Parallel download with many threads — direct WriteAt to temp file
 	_, err = ts.downloader.Download(ts.client.API(), location).
-		WithThreads(ts.cfg.DownloadThreads).
-		Parallel(job.Ctx, pwa)
+		WithThreads(threads).
+		WithVerify(false). // skip hash verification for speed
+		Parallel(job.Ctx, tmpFile)
+
+	close(done)
+
 	if err != nil {
 		return "", fmt.Errorf("parallel download failed: %w", err)
 	}

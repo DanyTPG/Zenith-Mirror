@@ -67,7 +67,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.DownloadMode = "stream"
 	}
 	if cfg.DownloadThreads <= 0 {
-		cfg.DownloadThreads = 8
+		cfg.DownloadThreads = 16
 	}
 	cfg.StatusRefreshDelay = cfg.StatusRefreshDelaySec
 	if cfg.StatusRefreshDelay <= 0 {

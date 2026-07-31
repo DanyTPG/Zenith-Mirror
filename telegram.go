@@ -899,19 +899,17 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	stopProgress := startProgressTracker(job, counter)
 	defer stopProgress()
 
-	// Create a multi-connection pool — distributes RPCs across N TCP connections
-	pool, err := ts.client.Pool(int64(threads))
+	// Create multi-connection pool to the correct DC
+	pool, poolCloser, err := createDownloadPool(job.Ctx, ts.client, location, int64(threads))
 	if err != nil {
 		slog.Warn("failed to create connection pool, falling back to single connection", "error", err)
-		// Fallback to single-connection download
 		_, err = ts.downloader.Download(ts.client.API(), location).
 			WithThreads(threads).
 			WithVerify(false).
 			Parallel(job.Ctx, counter)
 	} else {
-		defer pool.Close()
+		defer poolCloser.Close()
 		poolAPI := tg.NewClient(pool)
-		// Use CDN-aware download with pooled connections
 		dl := downloader.NewDownloader().
 			WithPartSize(512 * 1024).
 			WithAllowCDN(true)

@@ -10,17 +10,18 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 const (
-	rawChunkSize    = 512 * 1024 // 512KB — Telegram max
-	rawPipelineDepth = 2         // chunks in-flight per worker
+	rawChunkSize  = 512 * 1024
+	rawMaxRetries = 5
 )
 
 // rawParallelDownload bypasses gotd/td's downloader entirely.
 // Each goroutine independently calls UploadGetFile with its own offset range.
-// FILE_MIGRATE is handled per-call by client.API()'s invokeDirect.
-// Multiple goroutines create multiple concurrent connections to the remote DC.
+// FILE_MIGRATE handled per-call → multiple goroutines → multiple connections to remote DC.
+// FLOOD_WAIT handled with retry + backoff.
 func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, size int64, threads int, file *os.File) error {
 	if size <= 0 {
 		return fmt.Errorf("unknown file size %d", size)
@@ -30,14 +31,14 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 	slog.Info("raw parallel download", "chunks", totalChunks, "threads", threads, "size", size)
 
 	var (
-		written   atomic.Int64
-		firstErr  atomic.Value
-		sem       = make(chan struct{}, threads*rawPipelineDepth)
-		wg        sync.WaitGroup
+		written  atomic.Int64
+		firstErr atomic.Value
+		wg       sync.WaitGroup
 	)
 
+	sem := make(chan struct{}, threads)
+
 	for i := 0; i < totalChunks; i++ {
-		// Check for early abort
 		if firstErr.Load() != nil {
 			break
 		}
@@ -60,31 +61,13 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			req := &tg.UploadGetFileRequest{
-				Location: location,
-				Offset:   offset,
-				Limit:    chunkLen,
-			}
-			req.SetPrecise(true)
-
-			resp, err := api.UploadGetFile(ctx, req)
+			n, err := downloadChunkWithRetry(ctx, api, location, offset, chunkLen, chunkIdx, file)
 			if err != nil {
-				slog.Error("chunk download failed", "chunk", chunkIdx, "offset", offset, "error", err)
+				slog.Error("chunk download failed after retries", "chunk", chunkIdx, "offset", offset, "error", err)
 				firstErr.CompareAndSwap(nil, fmt.Errorf("chunk %d at offset %d: %w", chunkIdx, offset, err))
 				return
 			}
-
-			switch r := resp.(type) {
-			case *tg.UploadFile:
-				n, err := file.WriteAt(r.Bytes, offset)
-				if err != nil {
-					firstErr.CompareAndSwap(nil, fmt.Errorf("write chunk %d: %w", chunkIdx, err))
-					return
-				}
-				written.Add(int64(n))
-			default:
-				firstErr.CompareAndSwap(nil, fmt.Errorf("chunk %d: unexpected response type %T", chunkIdx, resp))
-			}
+			written.Add(int64(n))
 		}(offset, chunkLen, i)
 	}
 
@@ -94,9 +77,47 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 		return err.(error)
 	}
 
-	downloaded := written.Load()
-	slog.Info("raw parallel download complete", "bytes", downloaded)
+	slog.Info("raw parallel download complete", "bytes", written.Load())
 	return nil
+}
+
+// downloadChunkWithRetry downloads a single chunk with FLOOD_WAIT retry.
+func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, offset int64, chunkLen int, chunkIdx int, file *os.File) (int, error) {
+	for attempt := 0; attempt < rawMaxRetries; attempt++ {
+		req := &tg.UploadGetFileRequest{
+			Location: location,
+			Offset:   offset,
+			Limit:    chunkLen,
+		}
+		req.SetPrecise(true)
+
+		resp, err := api.UploadGetFile(ctx, req)
+		if err != nil {
+			if d, ok := tgerr.AsFloodWait(err); ok {
+				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d)
+				select {
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				case <-time.After(d):
+					continue
+				}
+			}
+			return 0, err
+		}
+
+		switch r := resp.(type) {
+		case *tg.UploadFile:
+			n, err := file.WriteAt(r.Bytes, offset)
+			if err != nil {
+				return 0, fmt.Errorf("write chunk %d: %w", chunkIdx, err)
+			}
+			return n, nil
+		default:
+			return 0, fmt.Errorf("chunk %d: unexpected response type %T", chunkIdx, resp)
+		}
+	}
+
+	return 0, fmt.Errorf("chunk %d: exceeded max retries (%d)", chunkIdx, rawMaxRetries)
 }
 
 // rawDownloadProgress tracks progress for rawParallelDownload.

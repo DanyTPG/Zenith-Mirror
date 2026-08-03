@@ -104,6 +104,10 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 			return ts.handleStats(ctx, entities, update)
 		}
 
+		if strings.HasPrefix(text, "/log") {
+			return ts.handleLog(ctx, entities, update)
+		}
+
 		if strings.HasPrefix(text, "/status") {
 			return ts.handleStatus(ctx, entities, update)
 		}
@@ -297,6 +301,30 @@ func (ts *TelegramService) clearLastStatusIf(id int) {
 		ts.lastStatusFn = nil
 	}
 	ts.lastStatusMu.Unlock()
+}
+
+// handleLog sends the last 10 lines of the log file in monospace.
+func (ts *TelegramService) handleLog(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+	data, err := os.ReadFile(ts.cfg.LogFile)
+	if err != nil {
+		_, rErr := ts.sender.Reply(entities, update).Text(ctx, "no log file")
+		return rErr
+	}
+
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > 10 {
+		lines = lines[len(lines)-10:]
+	}
+
+	var opts []styling.StyledTextOption
+	for i, l := range lines {
+		opts = append(opts, styling.Code(l))
+		if i < len(lines)-1 {
+			opts = append(opts, styling.Plain("\n"))
+		}
+	}
+	_, err = ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	return err
 }
 
 func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {

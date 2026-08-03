@@ -22,6 +22,7 @@ type Config struct {
 	AllowedUserIDs         []int64 `json:"allowed_user_ids"`
 	AuthorizedUsers        []int64 `json:"authorized_users"` // alias for AllowedUserIDs
 	MaxConcurrency         int     `json:"max_concurrency"`
+	LogFile                string  `json:"log_file"`
 	StatusRefreshDelaySec  int     `json:"status_refresh_delay_sec"`
 	StatusRefreshDelay     int     `json:"-"`
 }
@@ -54,6 +55,9 @@ func LoadConfig(path string) (*Config, error) {
 
 	if cfg.SessionFile == "" {
 		cfg.SessionFile = "session.json"
+	}
+	if cfg.LogFile == "" {
+		cfg.LogFile = "bot.log"
 	}
 	if cfg.GDriveCredentialsFile == "" {
 		cfg.GDriveCredentialsFile = "credentials.json"

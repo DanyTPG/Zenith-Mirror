@@ -19,10 +19,16 @@ const (
 	rawMaxRetries = 20
 )
 
-// rawParallelDownload bypasses gotd/td's downloader entirely.
-// Each goroutine independently calls UploadGetFile with its own offset range.
-// FILE_MIGRATE handled per-call → multiple goroutines → multiple connections to remote DC.
-// FLOOD_WAIT handled with retry + backoff.
+// rawParallelDownload is a true multi-connection downloader.
+// The caller supplies a *pool-based* invoker (ts.client.DC(dc, threads)) — a
+// pool that opens `threads` INDEPENDENT mtproto connections (each with its own
+// TCP socket + auth key to the target DC). Each goroutine below calls
+// UploadGetFile through that pool, so requests spread across distinct sockets.
+//
+// Why not gotd's built-in Parallel()? It funnels all chunk requests through a
+// single shared Client (client.API() → one mtproto.Conn). All N workers share
+// one TCP connection, so throughput caps around ~2MB/s regardless of threads.
+// A real pool of N sockets → ~11MB/s.
 func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, size int64, threads int, partSize int, file *os.File) error {
 	if size <= 0 {
 		return fmt.Errorf("unknown file size %d", size)

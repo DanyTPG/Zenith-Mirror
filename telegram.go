@@ -919,6 +919,10 @@ func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 // getOrCreatePool returns a cached pool for the given DC, or creates one.
+// The pool opens `threads` independent mtproto connections to the target DC —
+// this is the multi-socket engine that makes rawParallelDownload fast.
+// Pools are cached per DC so concurrent jobs share one multi-connection pool
+// instead of each racing to auth-export to the same DC.
 func (ts *TelegramService) getOrCreatePool(ctx context.Context, location tg.InputFileLocationClass, threads int) (tg.Invoker, io.Closer, error) {
 	dc, err := detectFileDC(ctx, ts.client, location)
 	if err != nil {

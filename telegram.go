@@ -109,7 +109,7 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 		}
 
 		if strings.HasPrefix(text, "/status") {
-			return ts.handleStatus(ctx, entities, update)
+			return ts.handleStatus(ctx, entities, update, msg)
 		}
 
 		if strings.HasPrefix(text, "/cancelall") {
@@ -327,14 +327,22 @@ func (ts *TelegramService) handleLog(ctx context.Context, entities tg.Entities, 
 	return err
 }
 
-func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-	ts.deleteLastStatus()
-	opts := ts.buildStatusStyledText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
-	if err != nil {
-		return err
+func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
+	if ts.jm.GetActiveJobCount() == 0 {
+		// No jobs — just send a static snapshot.
+		ts.deleteLastStatus()
+		opts := ts.buildStatusStyledText()
+		updates, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+		if err != nil {
+			return err
+		}
+		ts.setLastStatus(extractMsgIDFromUpdates(updates), nil)
+		return nil
 	}
-	ts.setLastStatus(extractMsgIDFromUpdates(updates), nil)
+
+	// Jobs active — run the same live updater the jobs use, so the status
+	// keeps refreshing until all jobs finish, then deletes itself.
+	ts.startLiveStatusUpdater(ctx, entities, update, msg)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,7 @@ import (
 
 const (
 	rawChunkSize  = 512 * 1024
-	rawMaxRetries = 5
+	rawMaxRetries = 20
 )
 
 // rawParallelDownload bypasses gotd/td's downloader entirely.
@@ -118,11 +119,15 @@ func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.Inp
 		resp, err := api.UploadGetFile(ctx, req)
 		if err != nil {
 			if d, ok := tgerr.AsFloodWait(err); ok {
-				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d)
+				// Add jitter so concurrent goroutines don't all wake at once
+				// and re-trigger FLOOD_WAIT together.
+				jitter := time.Duration(rand.Int63n(int64(d) / 2))
+				sleep := d + jitter
+				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d, "sleep", sleep)
 				select {
 				case <-ctx.Done():
 					return 0, ctx.Err()
-				case <-time.After(d):
+				case <-time.After(sleep):
 					continue
 				}
 			}

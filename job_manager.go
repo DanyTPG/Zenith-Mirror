@@ -119,6 +119,7 @@ func (jm *JobManager) FinishJob(id string) {
 	if job, ok := jm.active[id]; ok {
 		job.State = StateCompleted
 		delete(jm.active, id)
+		job.Cancel()
 	}
 
 	for i, qJob := range jm.queue {

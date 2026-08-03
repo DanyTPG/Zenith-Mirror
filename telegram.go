@@ -455,7 +455,10 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	statusCtx, cancel := context.WithCancel(ctx)
 	ts.setLastStatus(msgID, cancel)
 
-	statusDelay := 3 * time.Second
+	statusDelay := time.Duration(ts.cfg.StatusRefreshDelay) * time.Second
+	if statusDelay <= 0 {
+		statusDelay = 3 * time.Second
+	}
 	ticker := time.NewTicker(statusDelay)
 	defer ticker.Stop()
 
@@ -479,15 +482,22 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 
 			_, editErr := ts.sender.To(peer).Edit(msgID).StyledText(statusCtx, newOpts...)
 			if editErr != nil {
-				// Back off on FLOOD_WAIT
+				// Back off on FLOOD_WAIT, but cap it — otherwise a big wait
+				// (e.g. 8h) freezes the updater and it never notices job completion.
 				if d, ok := tgerr.AsFloodWait(editErr); ok {
 					statusDelay = d + time.Second
+					if statusDelay > 30*time.Second {
+						statusDelay = 30 * time.Second
+					}
 					ticker.Reset(statusDelay)
 				}
 				slog.Error("failed updating status message", "msg_id", msgID, "error", editErr)
 			} else {
 				// Reset delay on success
-				if statusDelay != 3*time.Second {
+				if statusDelay != time.Duration(ts.cfg.StatusRefreshDelay)*time.Second && ts.cfg.StatusRefreshDelay > 0 {
+					statusDelay = time.Duration(ts.cfg.StatusRefreshDelay) * time.Second
+					ticker.Reset(statusDelay)
+				} else if ts.cfg.StatusRefreshDelay <= 0 && statusDelay != 3*time.Second {
 					statusDelay = 3 * time.Second
 					ticker.Reset(statusDelay)
 				}

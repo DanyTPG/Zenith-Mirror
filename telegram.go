@@ -470,6 +470,8 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	ticker := time.NewTicker(statusDelay)
 	defer ticker.Stop()
 
+	var editAllowedAt time.Time
+
 	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID)
 
 	for {
@@ -485,6 +487,13 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 				return
 			}
 
+			// If a previous edit earned a long flood wait, skip edits entirely
+			// until it elapses — re-requesting the banned method every 30s can
+			// refresh/extend the ban server-side.
+			if !editAllowedAt.IsZero() && time.Now().Before(editAllowedAt) {
+				continue
+			}
+
 			newOpts := ts.buildStatusStyledText()
 			peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
 
@@ -496,6 +505,11 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 					statusDelay = d + time.Second
 					if statusDelay > 30*time.Second {
 						statusDelay = 30 * time.Second
+					}
+					// Long ban: park edits until the ban lapses.
+					if d > 2*time.Minute {
+						editAllowedAt = time.Now().Add(d + 5*time.Second)
+						slog.Warn("long flood wait on status edit, pausing edits", "wait", d)
 					}
 					ticker.Reset(statusDelay)
 				}

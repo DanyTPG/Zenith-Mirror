@@ -8,9 +8,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/gotd/contrib/middleware/floodwait"
+	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -42,10 +45,25 @@ func main() {
 	storage := &session.FileStorage{Path: cfg.SessionFile}
 	dispatcher := tg.NewUpdateDispatcher()
 
+	// Scheduler-based flood wait handler: waits out FLOOD_WAIT responses
+	// automatically instead of failing the call.
+	waiter := floodwait.NewWaiter().WithCallback(func(ctx context.Context, fw floodwait.FloodWait) {
+		slog.Warn("FLOOD_WAIT handled", "duration", fw.Duration)
+	})
+
+	// Token bucket rate limiter: proactive throttle on all RPCs.
+	rl := ratelimit.New(rate.Every(cfg.RPCDelay), cfg.RPCBurst)
+
 	clientOpts := telegram.Options{
 		SessionStorage: storage,
 		UpdateHandler:  dispatcher,
 		AllowCDN:       true,
+		Middlewares: []telegram.Middleware{
+			// Rate limit first, then flood wait recovery.
+			telegram.MiddlewareFunc(func(next tg.Invoker) telegram.InvokeFunc {
+				return rl.Handle(waiter.Handle(next))
+			}),
+		},
 	}
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, clientOpts)
 
@@ -54,10 +72,12 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- client.Run(ctx, func(ctx context.Context) error {
-			slog.Info("Zenith-Mirror bot engine running and listening for commands")
-			<-ctx.Done()
-			return nil
+		errCh <- waiter.Run(ctx, func(ctx context.Context) error {
+			return client.Run(ctx, func(ctx context.Context) error {
+				slog.Info("Zenith-Mirror bot engine running and listening for commands")
+				<-ctx.Done()
+				return nil
+			})
 		})
 	}()
 

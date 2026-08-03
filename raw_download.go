@@ -23,13 +23,16 @@ const (
 // Each goroutine independently calls UploadGetFile with its own offset range.
 // FILE_MIGRATE handled per-call → multiple goroutines → multiple connections to remote DC.
 // FLOOD_WAIT handled with retry + backoff.
-func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, size int64, threads int, file *os.File) error {
+func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, size int64, threads int, partSize int, file *os.File) error {
 	if size <= 0 {
 		return fmt.Errorf("unknown file size %d", size)
 	}
+	if partSize <= 0 || partSize%4096 != 0 {
+		partSize = rawChunkSize
+	}
 
-	totalChunks := int((size + rawChunkSize - 1) / int64(rawChunkSize))
-	slog.Info("raw parallel download", "chunks", totalChunks, "threads", threads, "size", size)
+	totalChunks := int((size + int64(partSize) - 1) / int64(partSize))
+	slog.Info("raw parallel download", "chunks", totalChunks, "threads", threads, "size", size, "part_size", partSize)
 
 	var (
 		written  atomic.Int64
@@ -50,8 +53,8 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 		case sem <- struct{}{}:
 		}
 
-		offset := int64(i) * int64(rawChunkSize)
-		end := offset + int64(rawChunkSize)
+		offset := int64(i) * int64(partSize)
+		end := offset + int64(partSize)
 		if end > size {
 			end = size
 		}
@@ -87,8 +90,8 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 		return err.(error)
 	}
 
-	// Handle remainder bytes (when file size not a multiple of 4096)
-	if remainder := size % int64(rawChunkSize); remainder > 0 && remainder%4096 != 0 {
+	// Handle remainder bytes (when file size not a multiple of partSize)
+	if remainder := size % int64(partSize); remainder > 0 && remainder%4096 != 0 {
 		if firstErr.Load() == nil {
 			offset := size - remainder
 			rounded := int(remainder) &^ 4095
@@ -107,6 +110,7 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 }
 
 // downloadChunkWithRetry downloads a single chunk with FLOOD_WAIT retry.
+// Backoff: wait + jitter, doubling per attempt (1x, 2x, 4x... capped at 64x).
 func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, offset int64, chunkLen int, chunkIdx int, file *os.File) (int, error) {
 	for attempt := 0; attempt < rawMaxRetries; attempt++ {
 		req := &tg.UploadGetFileRequest{
@@ -119,11 +123,14 @@ func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.Inp
 		resp, err := api.UploadGetFile(ctx, req)
 		if err != nil {
 			if d, ok := tgerr.AsFloodWait(err); ok {
-				// Add jitter so concurrent goroutines don't all wake at once
-				// and re-trigger FLOOD_WAIT together.
+				// Exponential backoff: multiply the wait by 2^attempt,
+				// capped so a huge ban doesn't stall forever. Jitter keeps
+				// concurrent goroutines from waking in lockstep.
+				mult := 1 << min(attempt, 6)
+				sleep := d * time.Duration(mult)
 				jitter := time.Duration(rand.Int63n(int64(d) / 2))
-				sleep := d + jitter
-				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d, "sleep", sleep)
+				sleep += jitter
+				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d, "attempt", attempt, "sleep", sleep)
 				select {
 				case <-ctx.Done():
 					return 0, ctx.Err()

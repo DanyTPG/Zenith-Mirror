@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 )
 
 type Config struct {
@@ -18,6 +19,11 @@ type Config struct {
 	IndexBaseURL           string  `json:"index_base_url"`
 	DownloadMode           string  `json:"download_mode"`    // "stream" (zero-disk) or "parallel" (temp file, faster)
 	DownloadThreads        int     `json:"download_threads"` // threads for parallel mode (default 4)
+	PartSize               int     `json:"part_size"`        // chunk size in bytes, multiple of 4096 (default 524288)
+	MaxConcurrentDownloads int     `json:"max_concurrent_downloads"` // global cap on simultaneous file downloads (default 4)
+	RPCDelay               time.Duration `json:"-"`          // rate limiter: min interval between RPCs
+	RPCBurst               int     `json:"rpc_burst"`        // rate limiter: token bucket burst (default 5)
+	RPCRatePerSec          float64 `json:"rpc_rate_per_sec"` // rate limiter: sustained RPCs/sec (default 10)
 	OwnerID                int64   `json:"owner_id"`
 	AllowedUserIDs         []int64 `json:"allowed_user_ids"`
 	AuthorizedUsers        []int64 `json:"authorized_users"` // alias for AllowedUserIDs
@@ -72,8 +78,21 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.DownloadMode = "stream"
 	}
 	if cfg.DownloadThreads <= 0 {
-		cfg.DownloadThreads = 16
+		cfg.DownloadThreads = 4
 	}
+	if cfg.PartSize <= 0 || cfg.PartSize%4096 != 0 {
+		cfg.PartSize = 512 * 1024
+	}
+	if cfg.MaxConcurrentDownloads <= 0 {
+		cfg.MaxConcurrentDownloads = 4
+	}
+	if cfg.RPCBurst <= 0 {
+		cfg.RPCBurst = 5
+	}
+	if cfg.RPCRatePerSec <= 0 {
+		cfg.RPCRatePerSec = 10
+	}
+	cfg.RPCDelay = time.Duration(float64(time.Second) / cfg.RPCRatePerSec)
 	cfg.StatusRefreshDelay = cfg.StatusRefreshDelaySec
 	if cfg.StatusRefreshDelay <= 0 {
 		cfg.StatusRefreshDelay = 5

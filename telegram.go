@@ -34,6 +34,7 @@ type TelegramService struct {
 	gdrive       *GDriveService
 	downloader   *LeechPipeline
 	jm           *JobManager
+	dm           *DownloadManager
 	cfg          *Config
 	startTime    time.Time
 	lastStatusID int
@@ -53,6 +54,7 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 		sender:    message.NewSender(client.API()),
 		gdrive:    gdrive,
 		jm:        jm,
+		dm:        NewDownloadManager(int64(cfg.MaxConcurrentDownloads)),
 		cfg:       cfg,
 		startTime: time.Now(),
 		poolCache: make(map[int]struct {
@@ -969,6 +971,12 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 
 	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
+	// Global cap on concurrent file downloads across all jobs (per-account limit).
+	if err := ts.dm.Acquire(ctx); err != nil {
+		return "", fmt.Errorf("acquire download slot: %w", err)
+	}
+	defer ts.dm.Release()
+
 	// Try to create multi-connection pool to remote DC for faster downloads
 	api := ts.client.API()
 	invoker, poolCloser, poolErr := ts.getOrCreatePool(ctx, location, threads)
@@ -979,7 +987,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 		defer poolCloser.Close()
 	}
 
-	err = rawParallelDownload(ctx, api, location, job.Size, threads, tmpFile)
+	err = rawParallelDownload(ctx, api, location, job.Size, threads, ts.cfg.PartSize, tmpFile)
 
 	cancel()
 

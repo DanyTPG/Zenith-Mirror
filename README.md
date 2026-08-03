@@ -69,7 +69,11 @@ See `example.config.json` for all available options.
 | `gdrive_folder_id` | Google Drive folder ID for uploads | - |
 | `index_base_url` | Base URL for direct file access links | - |
 | `download_mode` | `parallel` (fast, temp file) or `stream` (zero-disk) | `stream` |
-| `download_threads` | Threads for parallel download | `16` |
+| `download_threads` | Threads for parallel download | `4` |
+| `part_size` | Chunk size in bytes (must be multiple of 4096) | `524288` |
+| `max_concurrent_downloads` | Global cap on simultaneous file downloads | `4` |
+| `rpc_burst` | Rate limiter token bucket burst | `5` |
+| `rpc_rate_per_sec` | Rate limiter sustained RPCs/sec | `10` |
 | `owner_id` | Telegram user ID of the bot owner | - |
 | `allowed_user_ids` | Additional authorized user IDs | - |
 | `max_concurrency` | Max simultaneous transfers | `3` |

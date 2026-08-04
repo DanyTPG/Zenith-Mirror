@@ -848,6 +848,13 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 
 	go func() {
 		defer pw.Close()
+
+		if err := ts.dm.Acquire(job.Ctx); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		defer ts.dm.Release()
+
 		slog.Info("starting telegram media stream download", "job_id", job.ID)
 		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, progressWriter)
 		if err != nil {
@@ -992,10 +999,10 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	go rawDownloadProgress(ctx, tmpFile, job, job.Size)
 
 	// Global cap on concurrent file downloads across all jobs (per-account limit).
+	// Released immediately when rawParallelDownload finishes, before GDrive upload.
 	if err := ts.dm.Acquire(ctx); err != nil {
 		return "", fmt.Errorf("acquire download slot: %w", err)
 	}
-	defer ts.dm.Release()
 
 	// Try to create multi-connection pool to remote DC for faster downloads.
 	// Note: poolCloser is NOT closed per-job because pools are cached in ts.poolCache
@@ -1009,6 +1016,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	}
 
 	err = rawParallelDownload(ctx, api, location, job.Size, threads, ts.cfg.PartSize, tmpFile)
+	ts.dm.Release()
 
 	cancel()
 

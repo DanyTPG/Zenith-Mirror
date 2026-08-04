@@ -810,6 +810,7 @@ func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities
 }
 
 func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
+	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size, "mode", ts.cfg.DownloadMode)
 	job.Phase = PhaseDownloading
@@ -959,6 +960,21 @@ func (ts *TelegramService) getOrCreatePool(ctx context.Context, location tg.Inpu
 	return invoker, closer, nil
 }
 
+// ClosePools closes all cached DC pools on bot shutdown.
+func (ts *TelegramService) ClosePools() {
+	ts.poolMu.Lock()
+	defer ts.poolMu.Unlock()
+
+	for dc, p := range ts.poolCache {
+		slog.Info("closing cached DC pool", "dc", dc)
+		p.closer.Close()
+	}
+	ts.poolCache = make(map[int]struct {
+		invoker tg.Invoker
+		closer  io.Closer
+	})
+}
+
 func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFileLocationClass) (string, error) {
 	tmpFile, err := os.CreateTemp("", "zenith-dl-*")
 	if err != nil {
@@ -981,14 +997,15 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	}
 	defer ts.dm.Release()
 
-	// Try to create multi-connection pool to remote DC for faster downloads
+	// Try to create multi-connection pool to remote DC for faster downloads.
+	// Note: poolCloser is NOT closed per-job because pools are cached in ts.poolCache
+	// and shared across concurrent jobs. Closing it here would kill active jobs!
 	api := ts.client.API()
-	invoker, poolCloser, poolErr := ts.getOrCreatePool(ctx, location, threads)
+	invoker, _, poolErr := ts.getOrCreatePool(ctx, location, threads)
 	if poolErr != nil {
 		slog.Warn("pool creation failed, using single connection", "error", poolErr)
 	} else {
 		api = tg.NewClient(invoker)
-		defer poolCloser.Close()
 	}
 
 	err = rawParallelDownload(ctx, api, location, job.Size, threads, ts.cfg.PartSize, tmpFile)

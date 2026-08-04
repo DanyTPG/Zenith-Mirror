@@ -85,6 +85,7 @@ func main() {
 	case <-ctx.Done():
 		slog.Info("shutdown signal received")
 		jm.CancelAllJobs()
+		ts.ClosePools()
 		slog.Info("graceful shutdown complete")
 	case err := <-errCh:
 		if err != nil {

@@ -8,9 +8,23 @@ on:
 permissions:
   contents: write
 
+env:
+  LDFLAGS: -s -w
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, ext: "" }
+          - { goos: linux, goarch: arm64, ext: "" }
+          - { goos: linux, goarch: arm, goarm: "7", ext: "" }
+          # Android (Termux)
+          - { goos: android, goarch: arm64, ext: "" }
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+
     steps:
       - uses: actions/checkout@v4
 
@@ -19,14 +33,27 @@ jobs:
           go-version: '1.25'
 
       - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o zenith-mirror .
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zenith-mirror-linux-amd64
-          path: zenith-mirror
+          name: zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: zenith-mirror-*
           retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
 
       - name: Update rolling release
         uses: softprops/action-gh-release@v2
@@ -36,6 +63,6 @@ jobs:
           prerelease: false
           make_latest: true
           body: |
-            Automated build of master @ ${{ github.sha }}
-            Download: https://github.com/DanyTPG/Zenith-Mirror/releases/latest/download/zenith-mirror
-          files: zenith-mirror
+            Automated cross-platform build of master @ ${{ github.sha }}
+            Targets: linux/amd64, linux/arm64, linux/armv7, android/arm64 (Termux), windows/amd64
+          files: dist/*

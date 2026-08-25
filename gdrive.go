@@ -13,6 +13,8 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
+	"path/filepath"
+	"mime"
 	"google.golang.org/api/option"
 )
 
@@ -124,7 +126,14 @@ func (s *GDriveService) UploadStream(ctx context.Context, name string, r io.Read
 		f.Parents = []string{s.folderID}
 	}
 
-	call := s.service.Files.Create(f).Media(r, googleapi.ChunkSize(DriveChunkSize)).Context(ctx)
+	// ContentType set explicitly — without it googleapi sniffs by io.ReadAll'ing the
+	// whole stream into RAM before uploading (deadly for multi-GB pipes).
+	mimeType := mime.TypeByExtension(filepath.Ext(name))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	call := s.service.Files.Create(f).Media(r, googleapi.ChunkSize(DriveChunkSize), googleapi.ContentType(mimeType)).Context(ctx)
 	res, err := call.Do()
 	if err != nil {
 		return "", fmt.Errorf("drive upload failed: %w", err)

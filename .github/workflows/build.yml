@@ -5,6 +5,9 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,3 +27,15 @@ jobs:
           name: zenith-mirror-linux-amd64
           path: zenith-mirror
           retention-days: 30
+
+      - name: Push binary to bin branch
+        run: |
+          git clone --single-branch --branch bin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} binrepo 2>/dev/null || (git init binrepo && cd binrepo && git remote add origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }})
+          cd binrepo
+          git checkout -b bin 2>/dev/null || git checkout bin
+          cp ../zenith-mirror .
+          git config user.name "ci-bot"
+          git config user.email "ci@noreply.github.com"
+          git add zenith-mirror
+          git commit -m "build ${{ github.sha }}" || exit 0
+          git push origin bin --force

@@ -29,17 +29,18 @@ import (
 )
 
 type TelegramService struct {
-	client       *telegram.Client
-	sender       *message.Sender
-	gdrive       *GDriveService
-	downloader   *LeechPipeline
-	jm           *JobManager
-	dm           *DownloadManager
-	cfg          *Config
-	startTime    time.Time
-	lastStatusID int
-	lastStatusFn context.CancelFunc
-	lastStatusMu sync.Mutex
+	client         *telegram.Client
+	sender         *message.Sender
+	gdrive         *GDriveService
+	downloader     *LeechPipeline
+	jm             *JobManager
+	dm             *DownloadManager
+	cfg            *Config
+	startTime      time.Time
+	lastStatusID   int
+	lastStatusPeer tg.InputPeerClass
+	lastStatusFn   context.CancelFunc
+	lastStatusMu   sync.Mutex
 	// Pool cache: one pool per remote DC, shared across jobs
 	poolMu    sync.Mutex
 	poolCache map[int]struct {
@@ -72,71 +73,87 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 		if !ok || msg.Out {
 			return nil
 		}
+		return ts.handleIncomingMessage(ctx, entities, update, msg)
+	})
 
-		text := strings.TrimSpace(msg.Message)
-		if text == "" {
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, entities tg.Entities, update *tg.UpdateNewChannelMessage) error {
+		msg, ok := update.Message.(*tg.Message)
+		if !ok || msg.Out {
 			return nil
 		}
-
-		userID := ts.getUserID(msg)
-		if !ts.isAuthorized(userID) {
-			slog.Warn("unauthorized user access attempt", "user_id", userID, "text", text)
-			_, err := ts.sender.Reply(entities, update).Text(ctx, "Unauthorized user.")
-			return err
-		}
-
-		if strings.HasPrefix(text, "/start") {
-			_, err := ts.sender.Reply(entities, update).Text(ctx, "Welcome to Zenith Mirror! Send /help for commands.")
-			return err
-		}
-
-		if strings.HasPrefix(text, "/help") {
-			helpText := "Available commands:\n" +
-				"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
-				"/leech <url> - Leech direct link to Telegram\n" +
-				"/status - View active transfer jobs\n" +
-				"/cancel <id> - Cancel an active job\n" +
-				"/stats - View system performance and resource usage\n" +
-				"/help - View this message"
-			_, err := ts.sender.Reply(entities, update).Text(ctx, helpText)
-			return err
-		}
-
-		if strings.HasPrefix(text, "/stats") {
-			return ts.handleStats(ctx, entities, update)
-		}
-
-		if strings.HasPrefix(text, "/log") {
-			return ts.handleLog(ctx, entities, update)
-		}
-
-		if strings.HasPrefix(text, "/status") {
-			return ts.handleStatus(ctx, entities, update, msg)
-		}
-
-		if strings.HasPrefix(text, "/cancelall") {
-			return ts.handleCancelAll(ctx, entities, update)
-		}
-
-		if strings.HasPrefix(text, "/cancel") {
-			return ts.handleCancel(ctx, entities, update, text)
-		}
-
-		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
-			return ts.handleMirror(ctx, entities, update, msg, text, userID)
-		}
-
-		if strings.HasPrefix(text, "/leech") {
-			return ts.handleLeech(ctx, entities, update, msg, text, userID)
-		}
-
-		return nil
+		return ts.handleIncomingMessage(ctx, entities, update, msg)
 	})
+}
+
+func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message) error {
+	text := strings.TrimSpace(msg.Message)
+	if text == "" {
+		return nil
+	}
+
+	userID := ts.getUserID(msg)
+	if !ts.isAuthorized(userID) {
+		slog.Warn("unauthorized user access attempt", "user_id", userID, "text", text)
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Unauthorized user.")
+		return err
+	}
+
+	if strings.HasPrefix(text, "/start") {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Welcome to Zenith Mirror! Send /help for commands.")
+		return err
+	}
+
+	if strings.HasPrefix(text, "/help") {
+		helpText := "Available commands:\n" +
+			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
+			"/leech <url> - Leech direct link to Telegram\n" +
+			"/status - View active transfer jobs\n" +
+			"/cancel <id> - Cancel an active job\n" +
+			"/stats - View system performance and resource usage\n" +
+			"/help - View this message"
+		_, err := ts.sender.Reply(entities, update).Text(ctx, helpText)
+		return err
+	}
+
+	if strings.HasPrefix(text, "/stats") {
+		return ts.handleStats(ctx, entities, update)
+	}
+
+	if strings.HasPrefix(text, "/log") {
+		return ts.handleLog(ctx, entities, update)
+	}
+
+	if strings.HasPrefix(text, "/status") {
+		return ts.handleStatus(ctx, entities, update, msg)
+	}
+
+	if strings.HasPrefix(text, "/cancelall") {
+		return ts.handleCancelAll(ctx, entities, update)
+	}
+
+	if strings.HasPrefix(text, "/cancel") {
+		return ts.handleCancel(ctx, entities, update, text)
+	}
+
+	if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
+		return ts.handleMirror(ctx, entities, update, msg, text, userID)
+	}
+
+	if strings.HasPrefix(text, "/leech") {
+		return ts.handleLeech(ctx, entities, update, msg, text, userID)
+	}
+
+	return nil
 }
 
 func (ts *TelegramService) getUserID(msg *tg.Message) int64 {
 	if msg.FromID != nil {
 		if peerUser, ok := msg.FromID.(*tg.PeerUser); ok {
+			return peerUser.UserID
+		}
+	}
+	if msg.PeerID != nil {
+		if peerUser, ok := msg.PeerID.(*tg.PeerUser); ok {
 			return peerUser.UserID
 		}
 	}
@@ -155,7 +172,7 @@ func (ts *TelegramService) isAuthorized(userID int64) bool {
 	return false
 }
 
-func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, text string) error {
+func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, text string) error {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
@@ -170,13 +187,13 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	return err
 }
 
-func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate) error {
 	cancelled := ts.jm.CancelAllJobs()
 	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled %d job(s).", cancelled))
 	return err
 }
 
-func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate) error {
 	botUptime := formatDuration(time.Since(ts.startTime))
 
 	osUptimeStr := "N/A"
@@ -269,8 +286,10 @@ func formatDuration(d time.Duration) string {
 func (ts *TelegramService) deleteLastStatus() {
 	ts.lastStatusMu.Lock()
 	id := ts.lastStatusID
+	peer := ts.lastStatusPeer
 	fn := ts.lastStatusFn
 	ts.lastStatusID = 0
+	ts.lastStatusPeer = nil
 	ts.lastStatusFn = nil
 	ts.lastStatusMu.Unlock()
 	if fn != nil {
@@ -280,6 +299,16 @@ func (ts *TelegramService) deleteLastStatus() {
 		return
 	}
 	slog.Info("deleting previous status message", "status_msg_id", id)
+	if ch, ok := peer.(*tg.InputPeerChannel); ok {
+		_, err := ts.client.API().ChannelsDeleteMessages(context.Background(), &tg.ChannelsDeleteMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},
+			ID:      []int{id},
+		})
+		if err != nil {
+			slog.Error("failed to delete previous channel status message", "status_msg_id", id, "error", err)
+		}
+		return
+	}
 	_, err := ts.client.API().MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
 		Revoke: true,
 		ID:     []int{id},
@@ -289,9 +318,10 @@ func (ts *TelegramService) deleteLastStatus() {
 	}
 }
 
-func (ts *TelegramService) setLastStatus(id int, cancelFn context.CancelFunc) {
+func (ts *TelegramService) setLastStatus(id int, peer tg.InputPeerClass, cancelFn context.CancelFunc) {
 	ts.lastStatusMu.Lock()
 	ts.lastStatusID = id
+	ts.lastStatusPeer = peer
 	ts.lastStatusFn = cancelFn
 	ts.lastStatusMu.Unlock()
 }
@@ -300,13 +330,14 @@ func (ts *TelegramService) clearLastStatusIf(id int) {
 	ts.lastStatusMu.Lock()
 	if ts.lastStatusID == id {
 		ts.lastStatusID = 0
+		ts.lastStatusPeer = nil
 		ts.lastStatusFn = nil
 	}
 	ts.lastStatusMu.Unlock()
 }
 
 // handleLog sends the last 10 lines of the log file in monospace.
-func (ts *TelegramService) handleLog(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+func (ts *TelegramService) handleLog(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate) error {
 	data, err := os.ReadFile(ts.cfg.LogFile)
 	if err != nil {
 		_, rErr := ts.sender.Reply(entities, update).Text(ctx, "no log file")
@@ -329,7 +360,10 @@ func (ts *TelegramService) handleLog(ctx context.Context, entities tg.Entities, 
 	return err
 }
 
-func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message) error {
+func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message) error {
+	channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+	peer := ts.buildInputPeer(msg.PeerID, channelID, accessHash)
+
 	if ts.jm.GetActiveJobCount() == 0 {
 		// No jobs — just send a static snapshot.
 		ts.deleteLastStatus()
@@ -338,7 +372,7 @@ func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entitie
 		if err != nil {
 			return err
 		}
-		ts.setLastStatus(extractMsgIDFromUpdates(updates), nil)
+		ts.setLastStatus(extractMsgIDFromUpdates(updates), peer, nil)
 		return nil
 	}
 
@@ -446,7 +480,7 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	return options
 }
 
-func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, userMsg *tg.Message) {
+func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userMsg *tg.Message) {
 	ts.deleteLastStatus()
 
 	opts := ts.buildStatusStyledText()
@@ -462,8 +496,11 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 		return
 	}
 
+	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID, entities)
+	peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
+
 	statusCtx, cancel := context.WithCancel(ctx)
-	ts.setLastStatus(msgID, cancel)
+	ts.setLastStatus(msgID, peer, cancel)
 
 	statusDelay := time.Duration(ts.cfg.StatusRefreshDelay) * time.Second
 	if statusDelay <= 0 {
@@ -473,8 +510,6 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	defer ticker.Stop()
 
 	var editAllowedAt time.Time
-
-	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID)
 
 	for {
 		select {
@@ -497,7 +532,6 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 			}
 
 			newOpts := ts.buildStatusStyledText()
-			peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
 
 			_, editErr := ts.sender.To(peer).Edit(msgID).StyledText(statusCtx, newOpts...)
 			if editErr != nil {
@@ -550,9 +584,13 @@ func (ts *TelegramService) buildInputPeer(peer tg.PeerClass, channelID int64, ac
 	}
 }
 
-func extractPeerChannelInfo(peer tg.PeerClass) (int64, int64) {
+func extractPeerChannelInfo(peer tg.PeerClass, entities tg.Entities) (int64, int64) {
 	if p, ok := peer.(*tg.PeerChannel); ok {
-		return p.ChannelID, 0
+		var accessHash int64
+		if ch, ok := entities.Channels[p.ChannelID]; ok {
+			accessHash = ch.AccessHash
+		}
+		return p.ChannelID, accessHash
 	}
 	return 0, 0
 }
@@ -561,7 +599,12 @@ func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
 	switch u := updates.(type) {
 	case *tg.Updates:
 		for _, update := range u.Updates {
-			if newMsg, ok := update.(*tg.UpdateNewMessage); ok {
+			switch newMsg := update.(type) {
+			case *tg.UpdateNewMessage:
+				if msg, ok := newMsg.Message.(*tg.Message); ok {
+					return msg.ID
+				}
+			case *tg.UpdateNewChannelMessage:
 				if msg, ok := newMsg.Message.(*tg.Message); ok {
 					return msg.ID
 				}
@@ -573,7 +616,7 @@ func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
 	return 0
 }
 
-func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
+func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
 	parts := strings.Fields(text)
 
 	var rawURL string
@@ -632,12 +675,25 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	startMsgID := replyHeader.ReplyToMsgID
 	queuedJobs := 0
 
+	channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+
 	for offset := 0; offset < count; offset++ {
 		targetID := startMsgID + offset
 
-		res, err := ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
-			&tg.InputMessageID{ID: targetID},
-		})
+		var res tg.MessagesMessagesClass
+		var err error
+
+		if channelID != 0 {
+			res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+				Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash},
+				ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: targetID}},
+			})
+		} else {
+			res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
+				&tg.InputMessageID{ID: targetID},
+			})
+		}
+
 		if err != nil {
 			slog.Error("failed fetching message for batch mirror", "msg_id", targetID, "error", err)
 			continue
@@ -703,7 +759,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 }
 
 // sendMirrorCompletion sends the completion message with Name/Size/Type and a copy button for the index link.
-func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, job *Job, driveURL string) {
+func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, job *Job, driveURL string) {
 	baseURL := ts.cfg.IndexBaseURL
 	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
@@ -781,7 +837,7 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 	}
 }
 
-func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities tg.Entities, update *tg.UpdateNewMessage) {
+func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities tg.Entities, update message.AnswerableMessageUpdate) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing URL mirror job", "job_id", job.ID, "url", rawURL, "mode", ts.cfg.DownloadMode)
@@ -809,7 +865,7 @@ func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities
 	ts.sendMirrorCompletion(context.Background(), entities, update, job, driveURL)
 }
 
-func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update *tg.UpdateNewMessage) {
+func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update message.AnswerableMessageUpdate) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size, "mode", ts.cfg.DownloadMode)
@@ -856,12 +912,12 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 		defer ts.dm.Release()
 
 		slog.Info("starting telegram media stream download", "job_id", job.ID)
-		written, err := ts.downloader.Download(ts.client.API(), location).Stream(job.Ctx, progressWriter)
+		_, err := ts.client.Download(location).Stream(job.Ctx, progressWriter)
 		if err != nil {
 			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
 			pw.CloseWithError(err)
 		} else {
-			slog.Info("telegram media download stream finished", "job_id", job.ID, "bytes_written", written)
+			slog.Info("telegram media download stream finished", "job_id", job.ID)
 			job.Phase = PhaseUploading
 			job.Status = "Uploading to Google Drive"
 		}
@@ -1046,7 +1102,7 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 	return ts.gdrive.UploadStream(job.Ctx, job.FileName, progressReader, downloadedSize)
 }
 
-func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage, msg *tg.Message, text string, userID int64) error {
+func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /leech <url>")
@@ -1072,7 +1128,7 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	return nil
 }
 
-func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.Entities, update *tg.UpdateNewMessage) {
+func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.Entities, update message.AnswerableMessageUpdate) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing leech job", "job_id", job.ID, "url", rawURL)

@@ -672,6 +672,18 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	}
 
 	if rawURL != "" {
+		// If URL is a .torrent link, fetch bytes and handle as torrent mirror
+		if ts.torrentSvc != nil && (strings.HasSuffix(strings.ToLower(rawURL), ".torrent") || strings.Contains(strings.ToLower(rawURL), ".torrent?")) {
+			body, _, _, err := ts.downloader.DownloadHTTP(ctx, rawURL, nil)
+			if err == nil {
+				data, dErr := io.ReadAll(body)
+				body.Close()
+				if dErr == nil && len(data) > 0 {
+					return ts.handleTorrentMirror(ctx, entities, update, msg, "", data, userID)
+				}
+			}
+		}
+
 		urlParts := strings.Split(rawURL, "/")
 		fileName := urlParts[len(urlParts)-1]
 		if fileName == "" {
@@ -1239,6 +1251,18 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		return err
 	}
 	rawURL := parts[1]
+
+	// If URL is a .torrent link, fetch bytes and handle as torrent leech
+	if ts.torrentSvc != nil && (strings.HasSuffix(strings.ToLower(rawURL), ".torrent") || strings.Contains(strings.ToLower(rawURL), ".torrent?")) {
+		body, _, _, err := ts.downloader.DownloadHTTP(ctx, rawURL, nil)
+		if err == nil {
+			data, dErr := io.ReadAll(body)
+			body.Close()
+			if dErr == nil && len(data) > 0 {
+				return ts.handleTorrentLeech(ctx, entities, update, msg, "", data, userID)
+			}
+		}
+	}
 
 	var jobRef *Job
 	execFunc := func() {

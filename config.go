@@ -31,6 +31,8 @@ type Config struct {
 	LogFile                string  `json:"log_file"`
 	StatusRefreshDelaySec  int     `json:"status_refresh_delay_sec"`
 	StatusRefreshDelay     int     `json:"-"`
+	TorrentDownloadDir     string  `json:"torrent_download_dir"`  // temp dir for torrent pieces (default "torrent_downloads")
+	TorrentListenPort      int     `json:"torrent_listen_port"`   // DHT listen port (default 0 = random)
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -96,6 +98,12 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.StatusRefreshDelay = cfg.StatusRefreshDelaySec
 	if cfg.StatusRefreshDelay <= 0 {
 		cfg.StatusRefreshDelay = 5
+	}
+	if cfg.TorrentDownloadDir == "" {
+		cfg.TorrentDownloadDir = "torrent_downloads"
+	}
+	if cfg.TorrentListenPort < 0 {
+		cfg.TorrentListenPort = 0
 	}
 
 	return &cfg, nil

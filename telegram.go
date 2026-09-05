@@ -32,6 +32,7 @@ type TelegramService struct {
 	client         *telegram.Client
 	sender         *message.Sender
 	gdrive         *GDriveService
+	torrentSvc     *TorrentService
 	downloader     *LeechPipeline
 	jm             *JobManager
 	dm             *DownloadManager
@@ -65,6 +66,10 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 	}
 	ts.downloader = NewLeechPipeline(ts)
 	return ts
+}
+
+func (ts *TelegramService) SetTorrentService(svc *TorrentService) {
+	ts.torrentSvc = svc
 }
 
 func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
@@ -106,7 +111,8 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	if strings.HasPrefix(text, "/help") {
 		helpText := "Available commands:\n" +
 			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
-			"/leech <url> - Leech direct link to Telegram\n" +
+			"/mirror magnet:?xt=... OR reply to .torrent with /mirror - Torrent to Drive\n" +
+			"/leech <url> OR magnet:?xt=... - Leech to Telegram\n" +
 			"/status - View active transfer jobs\n" +
 			"/cancel <id> - Cancel an active job\n" +
 			"/stats - View system performance and resource usage\n" +
@@ -428,7 +434,11 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 		options = append(options, styling.Bold("Speed:"))
 		options = append(options, styling.Plain(fmt.Sprintf(" %s/s | ", FormatBytes(int64(j.Speed)))))
 		options = append(options, styling.Bold("ETA:"))
-		options = append(options, styling.Plain(fmt.Sprintf(" %s\n", etaStr)))
+		options = append(options, styling.Plain(fmt.Sprintf(" %s", etaStr)))
+		if j.IsTorrent {
+			options = append(options, styling.Plain(fmt.Sprintf(" | Peers: %d Seeds: %d", j.Peers, j.Seeds)))
+		}
+		options = append(options, styling.Plain("\n"))
 		options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
 		options = append(options, styling.Plain("\n\n"))
 	}
@@ -642,6 +652,15 @@ func extractMsgIDFromUpdates(updates tg.UpdatesClass) int {
 }
 
 func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
+	// Torrent via magnet in command text?
+	if ts.torrentSvc != nil {
+		for _, part := range strings.Fields(text) {
+			if strings.HasPrefix(part, "magnet:?") {
+				return ts.handleTorrentMirror(ctx, entities, update, msg, part, nil, userID)
+			}
+		}
+	}
+
 	parts := strings.Fields(text)
 
 	var rawURL string
@@ -677,6 +696,47 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return nil
 	}
 
+	// Reply to .torrent file? Handle as torrent mirror (single file, no batch).
+	if ts.torrentSvc != nil && msg.ReplyTo != nil {
+		if rh, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && rh.ReplyToMsgID != 0 {
+			// Try fetch replied message to see if it is a .torrent document
+			channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+			var res tg.MessagesMessagesClass
+			var err error
+			if channelID != 0 {
+				res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}}})
+			} else {
+				res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}})
+			}
+			if err == nil {
+				var slice []tg.MessageClass
+				switch m := res.(type) {
+				case *tg.MessagesMessages: slice = m.Messages
+				case *tg.MessagesMessagesSlice: slice = m.Messages
+				case *tg.MessagesChannelMessages: slice = m.Messages
+				}
+				if len(slice) > 0 {
+					if targetMsg, ok := slice[0].(*tg.Message); ok && targetMsg.Media != nil {
+						if docMedia, ok := targetMsg.Media.(*tg.MessageMediaDocument); ok {
+							if doc, ok := docMedia.Document.AsNotEmpty(); ok {
+								for _, attr := range doc.Attributes {
+									if fn, ok := attr.(*tg.DocumentAttributeFilename); ok {
+										if strings.HasSuffix(strings.ToLower(fn.FileName), ".torrent") {
+											loc := &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash, FileReference: doc.FileReference}
+											data, dErr := ts.downloadDocumentBytes(ctx, loc, doc.Size)
+											if dErr == nil {
+												return ts.handleTorrentMirror(ctx, entities, update, msg, "", data, userID)
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	if msg.ReplyTo == nil {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /mirror <url> OR reply to a media message with /mirror [-i count] to upload to Google Drive.")
 		return err
@@ -1128,6 +1188,51 @@ func (ts *TelegramService) executeMirrorParallel(job *Job, location tg.InputFile
 }
 
 func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
+	if ts.torrentSvc != nil {
+		for _, part := range strings.Fields(text) {
+			if strings.HasPrefix(part, "magnet:?") {
+				return ts.handleTorrentLeech(ctx, entities, update, msg, part, nil, userID)
+			}
+		}
+		if msg.ReplyTo != nil {
+			if rh, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && rh.ReplyToMsgID != 0 {
+				channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+				var res tg.MessagesMessagesClass
+				var err error
+				if channelID != 0 {
+					res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}}})
+				} else {
+					res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}})
+				}
+				if err == nil {
+					var slice []tg.MessageClass
+					switch m := res.(type) {
+					case *tg.MessagesMessages: slice = m.Messages
+					case *tg.MessagesMessagesSlice: slice = m.Messages
+					case *tg.MessagesChannelMessages: slice = m.Messages
+					}
+					if len(slice) > 0 {
+						if targetMsg, ok := slice[0].(*tg.Message); ok && targetMsg.Media != nil {
+							if docMedia, ok := targetMsg.Media.(*tg.MessageMediaDocument); ok {
+								if doc, ok := docMedia.Document.AsNotEmpty(); ok {
+									for _, attr := range doc.Attributes {
+										if fn, ok := attr.(*tg.DocumentAttributeFilename); ok {
+											if strings.HasSuffix(strings.ToLower(fn.FileName), ".torrent") {
+												loc := &tg.InputDocumentFileLocation{ID: doc.ID, AccessHash: doc.AccessHash, FileReference: doc.FileReference}
+												if data, dErr := ts.downloadDocumentBytes(ctx, loc, doc.Size); dErr == nil {
+													return ts.handleTorrentLeech(ctx, entities, update, msg, "", data, userID)
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /leech <url>")

@@ -47,6 +47,11 @@ type Job struct {
 	Ctx       context.Context
 	Cancel    context.CancelFunc
 	Execute   func()
+	// Torrent-specific
+	IsTorrent   bool
+	Seeds       int
+	Peers       int
+	TorrentHash string
 }
 
 type JobManager struct {

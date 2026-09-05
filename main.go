@@ -41,6 +41,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	torrentSvc, err := NewTorrentService(cfg)
+	if err != nil {
+		slog.Warn("torrent service disabled", "error", err)
+		torrentSvc = nil
+	}
+	if torrentSvc != nil {
+		defer torrentSvc.Close()
+	}
+
 	storage := &session.FileStorage{Path: cfg.SessionFile}
 	dispatcher := tg.NewUpdateDispatcher()
 
@@ -65,6 +74,7 @@ func main() {
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, clientOpts)
 
 	ts := NewTelegramService(client, gdrive, jm, cfg)
+	ts.SetTorrentService(torrentSvc)
 	ts.RegisterHandlers(dispatcher)
 
 	errCh := make(chan error, 1)

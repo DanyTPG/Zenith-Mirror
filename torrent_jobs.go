@@ -507,12 +507,8 @@ doneLeech:
 		}
 
 		// Send uploaded file to the Telegram chat
-		docMedia := message.UploadedDocument(inputFile).Filename(fileName)
-		mimeType := mime.TypeByExtension(filepath.Ext(fileName))
-		if mimeType != "" {
-			docMedia = docMedia.MIME(mimeType)
-		}
-		_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), docMedia)
+		mediaOpt := buildMediaOption(inputFile, fileName)
+		_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), mediaOpt)
 		if sendErr != nil {
 			slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
 			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))

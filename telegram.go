@@ -1326,12 +1326,8 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	}
 
 	// Send uploaded file to the Telegram chat
-	docMedia := message.UploadedDocument(inputFile).Filename(fileName)
-	mimeType := mime.TypeByExtension(filepath.Ext(fileName))
-	if mimeType != "" {
-		docMedia = docMedia.MIME(mimeType)
-	}
-	_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), docMedia)
+	mediaOpt := buildMediaOption(inputFile, fileName)
+	_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), mediaOpt)
 	if sendErr != nil {
 		slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
 		job.Status = fmt.Sprintf("Failed delivering to chat: %v", sendErr)
@@ -1340,6 +1336,58 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 
 	job.Status = "Completed"
 	slog.Info("leech job completed", "job_id", job.ID)
+}
+
+func buildMediaOption(inputFile tg.InputFileClass, fileName string) message.MediaOption {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	mimeType := mime.TypeByExtension(ext)
+
+	// Explicit video extensions
+	isVideo := strings.HasPrefix(mimeType, "video/") ||
+		ext == ".mkv" || ext == ".mp4" || ext == ".avi" || ext == ".mov" ||
+		ext == ".webm" || ext == ".flv" || ext == ".wmv" || ext == ".m4v" || ext == ".ts"
+
+	if isVideo {
+		if mimeType == "" {
+			mimeType = "video/mp4"
+			if ext == ".mkv" {
+				mimeType = "video/x-matroska"
+			} else if ext == ".webm" {
+				mimeType = "video/webm"
+			}
+		}
+		doc := message.UploadedDocument(inputFile).Filename(fileName).MIME(mimeType)
+		return doc.Video().SupportsStreaming()
+	}
+
+	// Explicit audio extensions
+	isAudio := strings.HasPrefix(mimeType, "audio/") ||
+		ext == ".mp3" || ext == ".m4a" || ext == ".flac" || ext == ".aac" ||
+		ext == ".ogg" || ext == ".opus" || ext == ".wav" || ext == ".wma"
+
+	if isAudio {
+		if mimeType == "" {
+			mimeType = "audio/mpeg"
+			if ext == ".flac" {
+				mimeType = "audio/flac"
+			} else if ext == ".m4a" {
+				mimeType = "audio/mp4"
+			} else if ext == ".ogg" || ext == ".opus" {
+				mimeType = "audio/ogg"
+			} else if ext == ".wav" {
+				mimeType = "audio/wav"
+			}
+		}
+		doc := message.UploadedDocument(inputFile).Filename(fileName).MIME(mimeType)
+		return doc.Audio()
+	}
+
+	// Default fallback: document with exact filename and MIME
+	doc := message.UploadedDocument(inputFile).Filename(fileName)
+	if mimeType != "" {
+		doc = doc.MIME(mimeType)
+	}
+	return doc
 }
 
 func (ts *TelegramService) executeLeechStream(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {

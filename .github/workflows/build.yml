@@ -38,7 +38,16 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-        run: go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+        run: |
+          go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} . 2>&1 | tee /tmp/build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload error on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: /tmp/build.log
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

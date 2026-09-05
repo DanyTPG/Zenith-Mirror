@@ -1325,7 +1325,12 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	}
 
 	// Send uploaded file to the Telegram chat
-	_, sendErr := ts.sender.Reply(entities, update).File(context.Background(), inputFile)
+	docMedia := message.UploadedDocument(inputFile).Filename(fileName)
+	mimeType := mime.TypeByExtension(filepath.Ext(fileName))
+	if mimeType != "" {
+		docMedia = docMedia.MIME(mimeType)
+	}
+	_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), docMedia)
 	if sendErr != nil {
 		slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
 		job.Status = fmt.Sprintf("Failed delivering to chat: %v", sendErr)

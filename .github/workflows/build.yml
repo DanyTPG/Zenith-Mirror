@@ -10,6 +10,7 @@ permissions:
 
 env:
   LDFLAGS: -s -w
+  CGO_ENABLED: 0
 
 jobs:
   build:

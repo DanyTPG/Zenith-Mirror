@@ -1310,16 +1310,25 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Telegram"
 
+	var inputFile tg.InputFileClass
 	var uploadErr error
 	if ts.cfg.DownloadMode == "parallel" && contentLength > 0 {
-		_, uploadErr = ts.executeLeechParallel(job, uploader, progressReader, fileName, contentLength)
+		inputFile, uploadErr = ts.executeLeechParallel(job, uploader, progressReader, fileName, contentLength)
 	} else {
-		_, uploadErr = ts.executeLeechStream(job, uploader, progressReader, fileName, contentLength)
+		inputFile, uploadErr = ts.executeLeechStream(job, uploader, progressReader, fileName, contentLength)
 	}
 
 	if uploadErr != nil {
 		slog.Error("leech upload failed", "job_id", job.ID, "error", uploadErr)
 		job.Status = fmt.Sprintf("Failed: %v", uploadErr)
+		return
+	}
+
+	// Send uploaded file to the Telegram chat
+	_, sendErr := ts.sender.Reply(entities, update).File(context.Background(), inputFile)
+	if sendErr != nil {
+		slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
+		job.Status = fmt.Sprintf("Failed delivering to chat: %v", sendErr)
 		return
 	}
 

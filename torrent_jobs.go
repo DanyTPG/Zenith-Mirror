@@ -491,11 +491,12 @@ doneLeech:
 				job.ETA = time.Duration(float64(remain)/speed) * time.Second
 			}
 		})
+		var inputFile tg.InputFileClass
 		var uploadErr error
 		if fileSize > 0 {
-			_, uploadErr = ts.executeLeechParallel(job, api, pr2, fileName, fileSize)
+			inputFile, uploadErr = ts.executeLeechParallel(job, api, pr2, fileName, fileSize)
 		} else {
-			_, uploadErr = ts.executeLeechStream(job, api, pr2, fileName, fileSize)
+			inputFile, uploadErr = ts.executeLeechStream(job, api, pr2, fileName, fileSize)
 		}
 		_ = fh.Close()
 		if uploadErr != nil {
@@ -503,6 +504,15 @@ doneLeech:
 			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
 			continue
 		}
+
+		// Send uploaded file to the Telegram chat
+		_, sendErr := ts.sender.Reply(entities, update).File(context.Background(), inputFile)
+		if sendErr != nil {
+			slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
+			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))
+			continue
+		}
+
 		atomic.AddInt64(&leechUploaded, fileSize)
 		slog.Info("torrent file leeched to Telegram", "job_id", job.ID, "file", fileName)
 	}

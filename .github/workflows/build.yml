@@ -59,7 +59,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --cleanup-tag -y || true
+          for rel_id in $(gh api repos/${{ github.repository }}/releases --jq '.[].id'); do
+            echo "Deleting old release $rel_id"
+            gh api --method DELETE repos/${{ github.repository }}/releases/$rel_id || true
+          done
+          git push origin :refs/tags/latest 2>/dev/null || true
 
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2

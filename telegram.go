@@ -390,17 +390,19 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 
 	var options []styling.StyledTextOption
 
-	for i, j := range jobs {
-		if j.State == StateQueued {
-			options = append(options, styling.Bold(fmt.Sprintf("%d.Queued:", i+1)))
-			options = append(options, styling.Plain(" "))
-			options = append(options, styling.Code(j.FileName))
-			options = append(options, styling.Plain(fmt.Sprintf("\nSize: %s | Status: Waiting in Queue\n", FormatBytes(j.Size))))
-			options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
-			options = append(options, styling.Plain("\n\n"))
-			continue
+	// Split into active (running) and queued to keep message well within 4096-char limit
+	var running []*Job
+	var queued []*Job
+	for _, j := range jobs {
+		if j.State == StateRunning {
+			running = append(running, j)
+		} else {
+			queued = append(queued, j)
 		}
+	}
 
+	// 1. Render all running jobs (active progress)
+	for i, j := range running {
 		bar := RenderProgressBar(j.ReadBytes, j.Size, 12)
 		pct := 0.0
 		if j.Size > 0 {
@@ -429,6 +431,29 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 		options = append(options, styling.Plain(fmt.Sprintf(" %s\n", etaStr)))
 		options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
 		options = append(options, styling.Plain("\n\n"))
+	}
+
+	// 2. Render queued jobs up to a cap (max 4 shown), summarize the rest
+	const maxQueuedShown = 4
+	queuedShown := len(queued)
+	if queuedShown > maxQueuedShown {
+		queuedShown = maxQueuedShown
+	}
+
+	for i := 0; i < queuedShown; i++ {
+		j := queued[i]
+		idx := len(running) + i + 1
+		options = append(options, styling.Bold(fmt.Sprintf("%d.Queued:", idx)))
+		options = append(options, styling.Plain(" "))
+		options = append(options, styling.Code(j.FileName))
+		options = append(options, styling.Plain(fmt.Sprintf("\nSize: %s | Status: Waiting in Queue\n", FormatBytes(j.Size))))
+		options = append(options, styling.Code(fmt.Sprintf("/cancel %s", j.ID)))
+		options = append(options, styling.Plain("\n\n"))
+	}
+
+	if len(queued) > maxQueuedShown {
+		remaining := len(queued) - maxQueuedShown
+		options = append(options, styling.Italic(fmt.Sprintf("... and %d more queued jobs (total queue: %d)\n\n", remaining, len(queued))))
 	}
 
 	cpuPercent := 0.0

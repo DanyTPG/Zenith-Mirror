@@ -1329,11 +1329,37 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 
 func (ts *TelegramService) executeLeechStream(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
 	u := uploader.NewUploader(api)
+	if ts.cfg.PartSize > 0 {
+		u = u.WithPartSize(ts.cfg.PartSize)
+	}
+	if size > 0 {
+		return u.Upload(job.Ctx, uploader.NewUpload(fileName, reader, size))
+	}
 	return u.FromReader(job.Ctx, fileName, reader)
 }
 
 func (ts *TelegramService) executeLeechParallel(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
-	u := uploader.NewUploader(api).WithThreads(ts.cfg.DownloadThreads)
+	threads := ts.cfg.DownloadThreads
+	if threads <= 0 {
+		threads = 4
+	}
+
+	uploadAPI := api
+	invoker, closer, err := ts.getOrCreatePool(job.Ctx, nil, threads)
+	if err == nil && invoker != nil {
+		uploadAPI = tg.NewClient(invoker)
+		_ = closer
+	} else {
+		slog.Warn("failed creating upload pool, using default client", "error", err)
+	}
+
+	u := uploader.NewUploader(uploadAPI).WithThreads(threads)
+	if ts.cfg.PartSize > 0 {
+		u = u.WithPartSize(ts.cfg.PartSize)
+	}
+	if size > 0 {
+		return u.Upload(job.Ctx, uploader.NewUpload(fileName, reader, size))
+	}
 	return u.FromReader(job.Ctx, fileName, reader)
 }
 

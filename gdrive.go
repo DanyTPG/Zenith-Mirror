@@ -119,15 +119,17 @@ func saveToken(path string, token *oauth2.Token) error {
 }
 
 func (s *GDriveService) UploadStream(ctx context.Context, name string, r io.Reader, size int64) (string, error) {
+	return s.UploadStreamToFolder(ctx, name, r, size, s.folderID)
+}
+
+func (s *GDriveService) UploadStreamToFolder(ctx context.Context, name string, r io.Reader, size int64, parentFolderID string) (string, error) {
 	f := &drive.File{
 		Name: name,
 	}
-	if s.folderID != "" {
-		f.Parents = []string{s.folderID}
+	if parentFolderID != "" {
+		f.Parents = []string{parentFolderID}
 	}
 
-	// ContentType set explicitly — without it googleapi sniffs by io.ReadAll'ing the
-	// whole stream into RAM before uploading (deadly for multi-GB pipes).
 	mimeType := mime.TypeByExtension(filepath.Ext(name))
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
@@ -147,4 +149,35 @@ func (s *GDriveService) UploadStream(ctx context.Context, name string, r io.Read
 
 	webLink := fmt.Sprintf("https://drive.google.com/file/d/%s/view", res.Id)
 	return webLink, nil
+}
+
+func (s *GDriveService) EnsureFolder(ctx context.Context, name string, parentFolderID string) (string, error) {
+	query := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and trashed = false", name)
+	if parentFolderID != "" {
+		query += fmt.Sprintf(" and '%s' in parents", parentFolderID)
+	}
+	r, err := s.service.Files.List().Q(query).Fields("files(id, name)").Context(ctx).Do()
+	if err == nil && len(r.Files) > 0 {
+		return r.Files[0].Id, nil
+	}
+
+	folder := &drive.File{
+		Name:     name,
+		MimeType: "application/vnd.google-apps.folder",
+	}
+	if parentFolderID != "" {
+		folder.Parents = []string{parentFolderID}
+	}
+	created, err := s.service.Files.Create(folder).Fields("id").Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("create drive folder %q: %w", name, err)
+	}
+
+	permission := &drive.Permission{
+		Type: "anyone",
+		Role: "reader",
+	}
+	_, _ = s.service.Permissions.Create(created.Id, permission).Context(ctx).Do()
+
+	return created.Id, nil
 }

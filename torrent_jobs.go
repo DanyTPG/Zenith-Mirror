@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -218,15 +219,67 @@ done:
 	job.Peers = stats.ActivePeers
 	slog.Info("torrent download complete", "job_id", job.ID, "name", job.FileName)
 
-	// Upload each file to GDrive
+	// Upload to GDrive
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Google Drive"
+	job.ReadBytes = 0
+	job.Size = t.Length() // Total size of all files combined
+	job.FileName = t.Name()
+
 	files := t.Files()
 	if len(files) == 0 {
 		slog.Error("torrent has no files", "job_id", job.ID)
 		job.Status = "Failed: no files in torrent"
 		cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
 		return
+	}
+
+	folderCache := make(map[string]string)
+	resolveFolder := func(relDir string) (string, error) {
+		if relDir == "" || relDir == "." {
+			return ts.gdrive.folderID, nil
+		}
+		if cached, ok := folderCache[relDir]; ok {
+			return cached, nil
+		}
+		parts := strings.Split(filepath.ToSlash(relDir), "/")
+		currentParent := ts.gdrive.folderID
+		accum := ""
+		for _, part := range parts {
+			if part == "" || part == "." {
+				continue
+			}
+			if accum == "" {
+				accum = part
+			} else {
+				accum = accum + "/" + part
+			}
+			if cached, ok := folderCache[accum]; ok {
+				currentParent = cached
+				continue
+			}
+			id, err := ts.gdrive.EnsureFolder(job.Ctx, part, currentParent)
+			if err != nil {
+				return "", err
+			}
+			folderCache[accum] = id
+			currentParent = id
+		}
+		return currentParent, nil
+	}
+
+	var overallUploaded int64
+	var lastURL string
+	var topFolderID string
+
+	if len(files) > 1 {
+		// Multi-file torrent: create a root folder on Drive for the torrent
+		var err error
+		topFolderID, err = resolveFolder(t.Name())
+		if err != nil {
+			slog.Error("failed to create root folder for torrent", "name", t.Name(), "error", err)
+			topFolderID = ts.gdrive.folderID
+		}
 	}
 
 	for idx, f := range files {
@@ -243,41 +296,66 @@ done:
 			slog.Error("torrent file missing on disk", "job_id", job.ID, "path", diskPath, "error", err)
 			continue
 		}
-		size := info.Size()
-		fileName := filepath.Base(f.DisplayPath())
-		if fileName == "" {
-			fileName = filepath.Base(f.Path())
+		fileSize := info.Size()
+		fileName := filepath.Base(diskPath)
+
+		// Compute parent folder in Drive
+		targetFolderID := ts.gdrive.folderID
+		if len(files) > 1 {
+			// f.Path() is <torrent_name>/dir1/dir2/file.ext
+			relFromRoot, _ := filepath.Rel(t.Name(), f.Path())
+			dirPart := filepath.Dir(relFromRoot)
+			if dirPart != "." && dirPart != "" {
+				fullRel := filepath.Join(t.Name(), dirPart)
+				parentID, fErr := resolveFolder(fullRel)
+				if fErr == nil {
+					targetFolderID = parentID
+				} else {
+					targetFolderID = topFolderID
+				}
+			} else {
+				targetFolderID = topFolderID
+			}
 		}
-		job.FileName = fileName
-		job.Size = size
-		job.ReadBytes = 0
-		job.Status = fmt.Sprintf("Uploading %d/%d to Drive", idx+1, len(files))
+
+		job.Status = fmt.Sprintf("Uploading file %d/%d: %s", idx+1, len(files), fileName)
 
 		fh, err := os.Open(diskPath)
 		if err != nil {
 			slog.Error("open torrent file failed", "job_id", job.ID, "path", diskPath, "error", err)
 			continue
 		}
-		pr2 := NewProgressReader(fh, size, func(read, total int64, speed float64, eta time.Duration) {
-			job.ReadBytes = read
+		pr2 := NewProgressReader(fh, fileSize, func(read, total int64, speed float64, eta time.Duration) {
+			currentTotal := atomic.LoadInt64(&overallUploaded) + read
+			job.ReadBytes = currentTotal
 			job.Speed = speed
-			job.ETA = eta
+			if speed > 0 && job.Size > currentTotal {
+				remain := job.Size - currentTotal
+				job.ETA = time.Duration(float64(remain)/speed) * time.Second
+			}
 		})
-		driveURL, err := ts.gdrive.UploadStream(job.Ctx, fileName, pr2, size)
+		driveURL, err := ts.gdrive.UploadStreamToFolder(job.Ctx, fileName, pr2, fileSize, targetFolderID)
 		_ = fh.Close()
 		if err != nil {
 			slog.Error("gdrive upload failed for torrent file", "job_id", job.ID, "file", fileName, "error", err)
-			job.Status = fmt.Sprintf("Failed upload %s: %v", fileName, err)
 			continue
 		}
+		lastURL = driveURL
+		atomic.AddInt64(&overallUploaded, fileSize)
 		slog.Info("torrent file uploaded", "job_id", job.ID, "file", fileName, "url", driveURL)
-		tmpJob := &Job{FileName: fileName, Size: size}
-		ts.sendMirrorCompletion(context.Background(), entities, update, tmpJob, driveURL)
 	}
 
 	job.Status = "Completed"
+	job.ReadBytes = job.Size
 	slog.Info("torrent mirror job completed", "job_id", job.ID)
 	cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
+
+	// Send ONE final completion message for the whole torrent
+	completionURL := lastURL
+	if len(files) > 1 && topFolderID != "" {
+		completionURL = fmt.Sprintf("https://drive.google.com/drive/folders/%s", topFolderID)
+	}
+	ts.sendMirrorCompletion(context.Background(), entities, update, job, completionURL)
 }
 
 func (ts *TelegramService) executeTorrentLeechJob(job *Job, magnetURI string, torrentBytes []byte, entities tg.Entities, update message.AnswerableMessageUpdate) {
@@ -364,6 +442,10 @@ doneLeech:
 
 	job.Phase = PhaseUploading
 	job.Status = "Uploading to Telegram"
+	job.ReadBytes = 0
+	job.Size = t.Length()
+	job.FileName = t.Name()
+
 	files := t.Files()
 	if len(files) == 0 {
 		job.Status = "Failed: no files in torrent"
@@ -371,6 +453,7 @@ doneLeech:
 		return
 	}
 	api := ts.client.API()
+	var leechUploaded int64
 	for idx, f := range files {
 		select {
 		case <-job.Ctx.Done():
@@ -385,36 +468,34 @@ doneLeech:
 			slog.Error("torrent file missing", "job_id", job.ID, "path", diskPath, "error", err)
 			continue
 		}
-		size := info.Size()
-		if size > 2*1024*1024*1024 {
-			slog.Warn("file exceeds Telegram bot limit, skipping", "job_id", job.ID, "file", f.DisplayPath(), "size", size)
-			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(size)))
+		fileSize := info.Size()
+		if fileSize > 2*1024*1024*1024 {
+			slog.Warn("file exceeds Telegram bot limit, skipping", "job_id", job.ID, "file", f.DisplayPath(), "size", fileSize)
+			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(fileSize)))
 			continue
 		}
-		fileName := filepath.Base(f.DisplayPath())
-		if fileName == "" {
-			fileName = filepath.Base(f.Path())
-		}
-		job.FileName = fileName
-		job.Size = size
-		job.ReadBytes = 0
-		job.Status = fmt.Sprintf("Uploading %d/%d to Telegram", idx+1, len(files))
+		fileName := filepath.Base(diskPath)
+		job.Status = fmt.Sprintf("Uploading file %d/%d to Telegram: %s", idx+1, len(files), fileName)
 
 		fh, err := os.Open(diskPath)
 		if err != nil {
 			slog.Error("open torrent file failed", "job_id", job.ID, "path", diskPath, "error", err)
 			continue
 		}
-		pr2 := NewProgressReader(fh, size, func(read, total int64, speed float64, eta time.Duration) {
-			job.ReadBytes = read
+		pr2 := NewProgressReader(fh, fileSize, func(read, total int64, speed float64, eta time.Duration) {
+			currentTotal := atomic.LoadInt64(&leechUploaded) + read
+			job.ReadBytes = currentTotal
 			job.Speed = speed
-			job.ETA = eta
+			if speed > 0 && job.Size > currentTotal {
+				remain := job.Size - currentTotal
+				job.ETA = time.Duration(float64(remain)/speed) * time.Second
+			}
 		})
 		var uploadErr error
-		if size > 0 {
-			_, uploadErr = ts.executeLeechParallel(job, api, pr2, fileName, size)
+		if fileSize > 0 {
+			_, uploadErr = ts.executeLeechParallel(job, api, pr2, fileName, fileSize)
 		} else {
-			_, uploadErr = ts.executeLeechStream(job, api, pr2, fileName, size)
+			_, uploadErr = ts.executeLeechStream(job, api, pr2, fileName, fileSize)
 		}
 		_ = fh.Close()
 		if uploadErr != nil {
@@ -422,9 +503,11 @@ doneLeech:
 			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
 			continue
 		}
+		atomic.AddInt64(&leechUploaded, fileSize)
 		slog.Info("torrent file leeched to Telegram", "job_id", job.ID, "file", fileName)
 	}
 	job.Status = "Completed"
+	job.ReadBytes = job.Size
 	slog.Info("torrent leech job completed", "job_id", job.ID)
 	cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
 }

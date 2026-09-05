@@ -37,25 +37,15 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
-          go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} . 2>&1 | tee /tmp/build.err
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            head -n 25 /tmp/build.err > commit_err.txt
-            git config user.name "CI"
-            git config user.email "ci@github.actions"
-            git fetch origin ci-err:ci-err 2>/dev/null || true
-            git checkout ci-err 2>/dev/null || git checkout -b ci-err
-            git add commit_err.txt
-            git commit -m "ci: capture build error [skip ci]" || true
-            git push origin ci-err --force || true
-            exit 1
-          fi
+          go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} . 2>&1 | tee /tmp/build.log
+          exit ${PIPESTATUS[0]}
 
       - name: Upload error on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: error-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: /tmp/build.err
+          path: /tmp/build.log
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

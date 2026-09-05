@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"

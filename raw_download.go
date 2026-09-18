@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"os"
@@ -115,9 +116,9 @@ func rawParallelDownload(ctx context.Context, api *tg.Client, location tg.InputF
 	return nil
 }
 
-// downloadChunkWithRetry downloads a single chunk with FLOOD_WAIT retry.
+// fetchChunkWithRetry downloads a single chunk with FLOOD_WAIT retry.
 // Backoff: wait + jitter, doubling per attempt (1x, 2x, 4x... capped at 64x).
-func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, offset int64, chunkLen int, chunkIdx int, file *os.File) (int, error) {
+func fetchChunkWithRetry(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, offset int64, chunkLen int, chunkIdx int) ([]byte, error) {
 	for attempt := 0; attempt < rawMaxRetries; attempt++ {
 		req := &tg.UploadGetFileRequest{
 			Location: location,
@@ -134,32 +135,181 @@ func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.Inp
 				// concurrent goroutines from waking in lockstep.
 				mult := 1 << min(attempt, 6)
 				sleep := d * time.Duration(mult)
-				jitter := time.Duration(rand.Int63n(int64(d) / 2))
+				jitter := time.Duration(rand.Int63n(int64(d)/2 + 1))
 				sleep += jitter
 				slog.Warn("flood wait, sleeping", "chunk", chunkIdx, "wait", d, "attempt", attempt, "sleep", sleep)
 				select {
 				case <-ctx.Done():
-					return 0, ctx.Err()
+					return nil, ctx.Err()
 				case <-time.After(sleep):
 					continue
 				}
 			}
-			return 0, err
+			return nil, err
 		}
 
 		switch r := resp.(type) {
 		case *tg.UploadFile:
-			n, err := file.WriteAt(r.Bytes, offset)
-			if err != nil {
-				return 0, fmt.Errorf("write chunk %d: %w", chunkIdx, err)
-			}
-			return n, nil
+			return r.Bytes, nil
 		default:
-			return 0, fmt.Errorf("chunk %d: unexpected response type %T", chunkIdx, resp)
+			return nil, fmt.Errorf("chunk %d: unexpected response type %T", chunkIdx, resp)
 		}
 	}
 
-	return 0, fmt.Errorf("chunk %d: exceeded max retries (%d)", chunkIdx, rawMaxRetries)
+	return nil, fmt.Errorf("chunk %d: exceeded max retries (%d)", chunkIdx, rawMaxRetries)
+}
+
+// downloadChunkWithRetry downloads a single chunk and writes it directly to file.
+func downloadChunkWithRetry(ctx context.Context, api *tg.Client, location tg.InputFileLocationClass, offset int64, chunkLen int, chunkIdx int, file *os.File) (int, error) {
+	data, err := fetchChunkWithRetry(ctx, api, location, offset, chunkLen, chunkIdx)
+	if err != nil {
+		return 0, err
+	}
+	n, err := file.WriteAt(data, offset)
+	if err != nil {
+		return 0, fmt.Errorf("write chunk %d: %w", chunkIdx, err)
+	}
+	return n, nil
+}
+
+type pipelinedChunkResult struct {
+	idx  int
+	data []byte
+	err  error
+}
+
+// rawPipelinedStream concurrently downloads chunks from Telegram using a pooled
+// multi-connection client, buffering up to windowSize chunks in memory and writing
+// them strictly sequentially to w (e.g. io.PipeWriter into Google Drive).
+func rawPipelinedStream(
+	ctx context.Context,
+	api *tg.Client,
+	location tg.InputFileLocationClass,
+	size int64,
+	threads int,
+	partSize int,
+	w io.Writer,
+) error {
+	if size <= 0 {
+		return fmt.Errorf("unknown file size %d", size)
+	}
+	if partSize <= 0 || partSize%4096 != 0 {
+		partSize = rawChunkSize
+	}
+	if threads <= 0 {
+		threads = 4
+	}
+
+	totalChunks := int((size + int64(partSize) - 1) / int64(partSize))
+	windowSize := threads * 2
+	if windowSize < 4 {
+		windowSize = 4
+	}
+
+	slog.Info("starting raw pipelined stream", "chunks", totalChunks, "threads", threads, "size", size, "part_size", partSize, "window", windowSize)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	windowSem := make(chan struct{}, windowSize)
+	results := make(chan pipelinedChunkResult, windowSize)
+	dispatch := make(chan int, threads)
+
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range dispatch {
+				offset := int64(idx) * int64(partSize)
+				end := offset + int64(partSize)
+				if end > size {
+					end = size
+				}
+				chunkLen := int(end - offset)
+				reqLimit := (chunkLen + 4095) &^ 4095
+				if reqLimit > partSize {
+					reqLimit = partSize
+				}
+
+				data, err := fetchChunkWithRetry(ctx, api, location, offset, reqLimit, idx)
+				if err == nil && len(data) > chunkLen {
+					data = data[:chunkLen]
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case results <- pipelinedChunkResult{idx: idx, data: data, err: err}:
+				}
+			}
+		}()
+	}
+
+	// Dispatcher loop
+	go func() {
+		defer close(dispatch)
+		for i := 0; i < totalChunks; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case windowSem <- struct{}{}:
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case dispatch <- i:
+			}
+		}
+	}()
+
+	// Cleanup worker wait
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	buffered := make(map[int][]byte)
+	nextIdx := 0
+
+	for res := range results {
+		if res.err != nil {
+			cancel()
+			return fmt.Errorf("chunk %d download failed: %w", res.idx, res.err)
+		}
+
+		buffered[res.idx] = res.data
+
+		for {
+			data, ok := buffered[nextIdx]
+			if !ok {
+				break
+			}
+			delete(buffered, nextIdx)
+
+			if len(data) > 0 {
+				if _, err := w.Write(data); err != nil {
+					cancel()
+					return fmt.Errorf("write chunk %d to stream: %w", nextIdx, err)
+				}
+			}
+
+			<-windowSem
+			nextIdx++
+
+			if nextIdx == totalChunks {
+				slog.Info("raw pipelined stream complete", "total_chunks", totalChunks, "bytes", size)
+				return nil
+			}
+		}
+	}
+
+	if nextIdx < totalChunks {
+		return fmt.Errorf("stream terminated early: wrote %d of %d chunks", nextIdx, totalChunks)
+	}
+
+	return nil
 }
 
 // rawDownloadProgress tracks progress for rawParallelDownload.

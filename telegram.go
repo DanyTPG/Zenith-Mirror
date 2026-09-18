@@ -1003,6 +1003,11 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 		job.ETA = eta
 	})
 
+	threads := ts.cfg.DownloadThreads
+	if threads <= 0 {
+		threads = 4
+	}
+
 	go func() {
 		defer pw.Close()
 
@@ -1012,8 +1017,23 @@ func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLo
 		}
 		defer ts.dm.Release()
 
-		slog.Info("starting telegram media stream download", "job_id", job.ID)
-		_, err := ts.client.Download(location).Stream(job.Ctx, progressWriter)
+		slog.Info("starting pipelined telegram media stream download", "job_id", job.ID, "threads", threads)
+
+		api := ts.client.API()
+		invoker, _, poolErr := ts.getOrCreatePool(job.Ctx, location, threads)
+		if poolErr != nil {
+			slog.Warn("pool creation failed, using single connection", "error", poolErr)
+		} else if invoker != nil {
+			api = tg.NewClient(invoker)
+		}
+
+		var err error
+		if job.Size > 0 {
+			err = rawPipelinedStream(job.Ctx, api, location, job.Size, threads, ts.cfg.PartSize, progressWriter)
+		} else {
+			_, err = ts.client.Download(location).Stream(job.Ctx, progressWriter)
+		}
+
 		if err != nil {
 			slog.Error("telegram media download stream error", "job_id", job.ID, "error", err)
 			pw.CloseWithError(err)
@@ -1396,14 +1416,7 @@ func buildMediaOption(inputFile tg.InputFileClass, fileName string) message.Medi
 }
 
 func (ts *TelegramService) executeLeechStream(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {
-	u := uploader.NewUploader(api)
-	if ts.cfg.PartSize > 0 {
-		u = u.WithPartSize(ts.cfg.PartSize)
-	}
-	if size > 0 {
-		return u.Upload(job.Ctx, uploader.NewUpload(fileName, reader, size))
-	}
-	return u.FromReader(job.Ctx, fileName, reader)
+	return ts.executeLeechParallel(job, api, reader, fileName, size)
 }
 
 func (ts *TelegramService) executeLeechParallel(job *Job, api *tg.Client, reader io.Reader, fileName string, size int64) (tg.InputFileClass, error) {

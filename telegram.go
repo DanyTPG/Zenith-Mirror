@@ -1109,9 +1109,13 @@ func (pw *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 // Pools are cached per DC so concurrent jobs share one multi-connection pool
 // instead of each racing to auth-export to the same DC.
 func (ts *TelegramService) getOrCreatePool(ctx context.Context, location tg.InputFileLocationClass, threads int) (tg.Invoker, io.Closer, error) {
-	dc, err := detectFileDC(ctx, ts.client, location)
-	if err != nil {
-		return nil, nil, fmt.Errorf("detect file DC: %w", err)
+	var dc int
+	var err error
+	if location != nil {
+		dc, err = detectFileDC(ctx, ts.client, location)
+		if err != nil {
+			return nil, nil, fmt.Errorf("detect file DC: %w", err)
+		}
 	}
 
 	ts.poolMu.Lock()

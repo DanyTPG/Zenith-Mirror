@@ -305,6 +305,10 @@ func rawPipelinedStream(
 		}
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	if nextIdx < totalChunks {
 		return fmt.Errorf("stream terminated early: wrote %d of %d chunks", nextIdx, totalChunks)
 	}

@@ -57,7 +57,7 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 	job.IsTorrent = true
 	jobRef = job
 	slog.Info("torrent mirror job created", "job_id", job.ID, "name", displayName)
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
 	return nil
 }
 
@@ -97,7 +97,7 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	job.IsTorrent = true
 	jobRef = job
 	slog.Info("torrent leech job created", "job_id", job.ID, "name", displayName)
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
 	return nil
 }
 

@@ -135,11 +135,11 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	}
 
 	if strings.HasPrefix(text, "/cancelall") {
-		return ts.handleCancelAll(ctx, entities, update)
+		return ts.handleCancelAll(ctx, entities, update, msg)
 	}
 
 	if strings.HasPrefix(text, "/cancel") {
-		return ts.handleCancel(ctx, entities, update, text)
+		return ts.handleCancel(ctx, entities, update, msg, text)
 	}
 
 	if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
@@ -179,7 +179,7 @@ func (ts *TelegramService) isAuthorized(userID int64) bool {
 	return false
 }
 
-func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, text string) error {
+func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string) error {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
@@ -188,15 +188,33 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	jobID := parts[1]
 	if ts.jm.CancelJob(jobID) {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
+		ts.deleteLastStatus()
+		if ts.jm.GetActiveJobCount() > 0 {
+			go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+		} else {
+			opts := ts.buildStatusStyledText()
+			updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
+			channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+			peer := ts.buildInputPeer(msg.PeerID, channelID, accessHash)
+			ts.setLastStatus(extractMsgIDFromUpdates(updates), peer, nil)
+		}
 		return err
 	}
 	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
 	return err
 }
 
-func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate) error {
+func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message) error {
 	cancelled := ts.jm.CancelAllJobs()
 	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled %d job(s).", cancelled))
+	if cancelled > 0 {
+		ts.deleteLastStatus()
+		opts := ts.buildStatusStyledText()
+		updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
+		channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
+		peer := ts.buildInputPeer(msg.PeerID, channelID, accessHash)
+		ts.setLastStatus(extractMsgIDFromUpdates(updates), peer, nil)
+	}
 	return err
 }
 
@@ -520,7 +538,7 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	ts.deleteLastStatus()
 
 	opts := ts.buildStatusStyledText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	updates, err := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
 	if err != nil {
 		slog.Error("failed sending initial live status message", "error", err)
 		return
@@ -535,7 +553,7 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID, entities)
 	peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
 
-	statusCtx, cancel := context.WithCancel(ctx)
+	statusCtx, cancel := context.WithCancel(context.Background())
 	ts.setLastStatus(msgID, peer, cancel)
 
 	statusDelay := time.Duration(ts.cfg.StatusRefreshDelay) * time.Second
@@ -550,7 +568,6 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 	for {
 		select {
 		case <-statusCtx.Done():
-			ts.deleteLastStatus()
 			return
 		case <-ticker.C:
 			activeJobs := ts.jm.GetActiveJobs()
@@ -685,11 +702,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			}
 		}
 
-		urlParts := strings.Split(rawURL, "/")
-		fileName := urlParts[len(urlParts)-1]
-		if fileName == "" {
-			fileName = "downloaded_file.bin"
-		}
+		fileName := ExtractFileName(rawURL, "")
 
 		var jobRef *Job
 		execFunc := func() {
@@ -705,7 +718,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		jobRef = job
 
 		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
-		go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+		go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
 		return nil
 	}
 
@@ -841,17 +854,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	statusCtx, statusCancel := context.WithCancel(ctx)
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if ts.jm.GetActiveJobCount() == 0 {
-				statusCancel()
-				return
-			}
-		}
-	}()
-	go ts.startLiveStatusUpdater(statusCtx, entities, update, msg)
+	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
 
 	return nil
 }
@@ -1270,7 +1273,8 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		ts.executeLeechJob(jobRef, rawURL, entities, update)
 	}
 
-	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, rawURL, 0, userID, execFunc)
+	fileName := ExtractFileName(rawURL, "")
+	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, fileName, 0, userID, execFunc)
 	if err != nil {
 		slog.Error("failed creating leech job", "error", err)
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
@@ -1279,7 +1283,7 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
-	go ts.startLiveStatusUpdater(job.Ctx, entities, update, msg)
+	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
 	return nil
 }
 
@@ -1341,6 +1345,7 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 func buildMediaOption(inputFile tg.InputFileClass, fileName string) message.MediaOption {
 	ext := strings.ToLower(filepath.Ext(fileName))
 	mimeType := mime.TypeByExtension(ext)
+	caption := styling.Plain(fileName)
 
 	// Explicit video extensions
 	isVideo := strings.HasPrefix(mimeType, "video/") ||
@@ -1356,7 +1361,7 @@ func buildMediaOption(inputFile tg.InputFileClass, fileName string) message.Medi
 				mimeType = "video/webm"
 			}
 		}
-		doc := message.UploadedDocument(inputFile).Filename(fileName).MIME(mimeType)
+		doc := message.UploadedDocument(inputFile, caption).Filename(fileName).MIME(mimeType)
 		return doc.Video().SupportsStreaming()
 	}
 
@@ -1378,12 +1383,12 @@ func buildMediaOption(inputFile tg.InputFileClass, fileName string) message.Medi
 				mimeType = "audio/wav"
 			}
 		}
-		doc := message.UploadedDocument(inputFile).Filename(fileName).MIME(mimeType)
+		doc := message.UploadedDocument(inputFile, caption).Filename(fileName).MIME(mimeType)
 		return doc.Audio()
 	}
 
 	// Default fallback: document with exact filename and MIME
-	doc := message.UploadedDocument(inputFile).Filename(fileName)
+	doc := message.UploadedDocument(inputFile, caption).Filename(fileName)
 	if mimeType != "" {
 		doc = doc.MIME(mimeType)
 	}

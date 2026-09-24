@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -44,9 +45,10 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 			displayName = displayName[:60] + "..."
 		}
 	}
+	target := extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFn := func() {
-		ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes, entities, update)
+		ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes)
 	}
 	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, displayName, 0, userID, execFn)
 	if err != nil {
@@ -55,9 +57,14 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 		return err
 	}
 	job.IsTorrent = true
+	job.Kind = "torrent_mirror"
+	job.Target = target
+	job.MagnetURI = magnetURI
+	job.TorrentBytes = torrentBytes
+	ts.jm.SaveState()
 	jobRef = job
 	slog.Info("torrent mirror job created", "job_id", job.ID, "name", displayName)
-	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+	go ts.startLiveStatusUpdater(target)
 	return nil
 }
 
@@ -84,9 +91,10 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	if strings.HasPrefix(displayName, "magnet:?") && len(displayName) > 60 {
 		displayName = displayName[:60] + "..."
 	}
+	target := extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFn := func() {
-		ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes, entities, update)
+		ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes)
 	}
 	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, displayName, 0, userID, execFn)
 	if err != nil {
@@ -95,9 +103,14 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 		return err
 	}
 	job.IsTorrent = true
+	job.Kind = "torrent_leech"
+	job.Target = target
+	job.MagnetURI = magnetURI
+	job.TorrentBytes = torrentBytes
+	ts.jm.SaveState()
 	jobRef = job
 	slog.Info("torrent leech job created", "job_id", job.ID, "name", displayName)
-	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+	go ts.startLiveStatusUpdater(target)
 	return nil
 }
 
@@ -121,7 +134,7 @@ func (ts *TelegramService) downloadDocumentBytes(ctx context.Context, loc tg.Inp
 	return data, nil
 }
 
-func (ts *TelegramService) executeTorrentMirrorJob(job *Job, magnetURI string, torrentBytes []byte, entities tg.Entities, update message.AnswerableMessageUpdate) {
+func (ts *TelegramService) executeTorrentMirrorJob(job *Job, magnetURI string, torrentBytes []byte) {
 	defer ts.jm.FinishJob(job.ID)
 	job.IsTorrent = true
 	job.Phase = PhaseDownloading
@@ -137,6 +150,7 @@ func (ts *TelegramService) executeTorrentMirrorJob(job *Job, magnetURI string, t
 	if err != nil {
 		slog.Error("torrent add failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
+		ts.sendJobFailure(job, err)
 		return
 	}
 	defer ts.torrentSvc.Drop(t)
@@ -150,12 +164,14 @@ func (ts *TelegramService) executeTorrentMirrorJob(job *Job, magnetURI string, t
 	if err := ts.torrentSvc.WaitForInfo(job.Ctx, t); err != nil {
 		slog.Error("torrent metadata failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed metadata: %v", err)
+		ts.sendJobFailure(job, fmt.Errorf("resolving metadata failed: %w", err))
 		return
 	}
 	job.FileName = t.Name()
 	job.Size = t.Length()
 	tryHash := t.InfoHash().HexString()
 	job.TorrentHash = tryHash
+	ts.jm.SaveState()
 	slog.Info("torrent metadata ready", "job_id", job.ID, "name", job.FileName, "size", job.Size, "hash", tryHash)
 
 	// Disk space check
@@ -163,6 +179,7 @@ func (ts *TelegramService) executeTorrentMirrorJob(job *Job, magnetURI string, t
 		if err := checkDiskSpace(ts.cfg.TorrentDownloadDir, job.Size); err != nil {
 			slog.Error("disk space check failed", "job_id", job.ID, "error", err)
 			job.Status = fmt.Sprintf("Failed: %v", err)
+			ts.sendJobFailure(job, err)
 			return
 		}
 	}
@@ -231,6 +248,7 @@ done:
 		slog.Error("torrent has no files", "job_id", job.ID)
 		job.Status = "Failed: no files in torrent"
 		cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
+		ts.sendJobFailure(job, errors.New("no files in torrent"))
 		return
 	}
 
@@ -355,10 +373,10 @@ done:
 	if len(files) > 1 && topFolderID != "" {
 		completionURL = fmt.Sprintf("https://drive.google.com/drive/folders/%s", topFolderID)
 	}
-	ts.sendMirrorCompletion(context.Background(), entities, update, job, completionURL)
+	ts.sendMirrorCompletion(context.Background(), job, completionURL)
 }
 
-func (ts *TelegramService) executeTorrentLeechJob(job *Job, magnetURI string, torrentBytes []byte, entities tg.Entities, update message.AnswerableMessageUpdate) {
+func (ts *TelegramService) executeTorrentLeechJob(job *Job, magnetURI string, torrentBytes []byte) {
 	defer ts.jm.FinishJob(job.ID)
 	job.IsTorrent = true
 	job.Phase = PhaseDownloading
@@ -374,6 +392,7 @@ func (ts *TelegramService) executeTorrentLeechJob(job *Job, magnetURI string, to
 	if err != nil {
 		slog.Error("torrent add failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
+		ts.sendJobFailure(job, err)
 		return
 	}
 	defer ts.torrentSvc.Drop(t)
@@ -382,17 +401,20 @@ func (ts *TelegramService) executeTorrentLeechJob(job *Job, magnetURI string, to
 	if err := ts.torrentSvc.WaitForInfo(job.Ctx, t); err != nil {
 		slog.Error("torrent metadata failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed metadata: %v", err)
+		ts.sendJobFailure(job, fmt.Errorf("resolving metadata failed: %w", err))
 		return
 	}
 	job.FileName = t.Name()
 	job.Size = t.Length()
 	job.TorrentHash = t.InfoHash().HexString()
+	ts.jm.SaveState()
 	slog.Info("torrent leech metadata ready", "job_id", job.ID, "name", job.FileName, "size", job.Size)
 
 	if job.Size > 0 {
 		if err := checkDiskSpace(ts.cfg.TorrentDownloadDir, job.Size); err != nil {
 			slog.Error("disk space check failed", "job_id", job.ID, "error", err)
 			job.Status = fmt.Sprintf("Failed: %v", err)
+			ts.sendJobFailure(job, err)
 			return
 		}
 	}
@@ -450,6 +472,7 @@ doneLeech:
 	if len(files) == 0 {
 		job.Status = "Failed: no files in torrent"
 		cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
+		ts.sendJobFailure(job, errors.New("no files in torrent"))
 		return
 	}
 	api := ts.client.API()
@@ -471,7 +494,7 @@ doneLeech:
 		fileSize := info.Size()
 		if fileSize > 2*1024*1024*1024 {
 			slog.Warn("file exceeds Telegram bot limit, skipping", "job_id", job.ID, "file", f.DisplayPath(), "size", fileSize)
-			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(fileSize)))
+			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(fileSize)))
 			continue
 		}
 		fileName := filepath.Base(diskPath)
@@ -501,16 +524,16 @@ doneLeech:
 		_ = fh.Close()
 		if uploadErr != nil {
 			slog.Error("telegram upload failed for torrent file", "job_id", job.ID, "file", fileName, "error", uploadErr)
-			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
+			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
 			continue
 		}
 
 		// Send uploaded file to the Telegram chat
 		mediaOpt := buildMediaOption(inputFile, fileName)
-		_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), mediaOpt)
+		_, sendErr := ts.targetSender(job.Target).Media(context.Background(), mediaOpt)
 		if sendErr != nil {
 			slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
-			_, _ = ts.sender.Reply(entities, update).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))
+			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))
 			continue
 		}
 

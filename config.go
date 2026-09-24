@@ -60,6 +60,7 @@ type Config struct {
 	StatusRefreshDelay     int       `json:"-"`
 	TorrentDownloadDir     string    `json:"torrent_download_dir"`  // temp dir for torrent pieces (default "torrent_downloads")
 	TorrentListenPort      int       `json:"torrent_listen_port"`   // DHT listen port (default 0 = random)
+	JobStateFile           string    `json:"job_state_file"`        // persistence file for restart resume (default "jobs_state.json")
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -131,6 +132,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.TorrentListenPort < 0 {
 		cfg.TorrentListenPort = 0
+	}
+	if cfg.JobStateFile == "" {
+		cfg.JobStateFile = "jobs_state.json"
 	}
 
 	// Merge all allowed chat ID variations

@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -209,7 +211,7 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
 		ts.deleteLastStatus()
 		if ts.jm.GetActiveJobCount() > 0 {
-			go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+			go ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
 		} else {
 			opts := ts.buildStatusStyledText()
 			updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
@@ -422,7 +424,7 @@ func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entitie
 
 	// Jobs active — run the same live updater the jobs use, so the status
 	// keeps refreshing until all jobs finish, then deletes itself.
-	ts.startLiveStatusUpdater(ctx, entities, update, msg)
+	ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
 	return nil
 }
 
@@ -553,11 +555,16 @@ func (ts *TelegramService) buildStatusStyledText() []styling.StyledTextOption {
 	return options
 }
 
-func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userMsg *tg.Message) {
+func (ts *TelegramService) startLiveStatusUpdater(target JobTarget) {
 	ts.deleteLastStatus()
 
+	peer := ts.inputPeerFromTarget(target)
 	opts := ts.buildStatusStyledText()
-	updates, err := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
+	builder := ts.sender.To(peer)
+	if target.ReplyMsgID > 0 {
+		builder = builder.Reply(target.ReplyMsgID)
+	}
+	updates, err := builder.StyledText(context.Background(), opts...)
 	if err != nil {
 		slog.Error("failed sending initial live status message", "error", err)
 		return
@@ -568,9 +575,6 @@ func (ts *TelegramService) startLiveStatusUpdater(ctx context.Context, entities 
 		slog.Warn("could not extract message ID for live status update")
 		return
 	}
-
-	channelID, accessHash := extractPeerChannelInfo(userMsg.PeerID, entities)
-	peer := ts.buildInputPeer(userMsg.PeerID, channelID, accessHash)
 
 	statusCtx, cancel := context.WithCancel(context.Background())
 	ts.setLastStatus(msgID, peer, cancel)
@@ -656,6 +660,128 @@ func (ts *TelegramService) buildInputPeer(peer tg.PeerClass, channelID int64, ac
 	}
 }
 
+func extractJobTarget(msg *tg.Message, entities tg.Entities) JobTarget {
+	target := JobTarget{
+		ReplyMsgID: msg.ID,
+		UserID:     extractUserID(msg),
+	}
+	switch p := msg.PeerID.(type) {
+	case *tg.PeerUser:
+		target.PeerType = "user"
+		target.UserID = p.UserID
+	case *tg.PeerChat:
+		target.PeerType = "chat"
+		target.ChatID = p.ChatID
+	case *tg.PeerChannel:
+		target.PeerType = "channel"
+		target.ChannelID = p.ChannelID
+		if ch, ok := entities.Channels[p.ChannelID]; ok {
+			target.AccessHash = ch.AccessHash
+		}
+	}
+	return target
+}
+
+func (ts *TelegramService) inputPeerFromTarget(target JobTarget) tg.InputPeerClass {
+	switch target.PeerType {
+	case "user":
+		return &tg.InputPeerUser{UserID: target.UserID}
+	case "chat":
+		return &tg.InputPeerChat{ChatID: target.ChatID}
+	case "channel":
+		return &tg.InputPeerChannel{ChannelID: target.ChannelID, AccessHash: target.AccessHash}
+	default:
+		return &tg.InputPeerSelf{}
+	}
+}
+
+func (ts *TelegramService) targetSender(target JobTarget) *message.Builder {
+	peer := ts.inputPeerFromTarget(target)
+	builder := ts.sender.To(peer)
+	if target.ReplyMsgID > 0 {
+		builder = builder.Reply(target.ReplyMsgID)
+	}
+	return builder
+}
+
+func (ts *TelegramService) sendTargetFailure(target JobTarget, name string, action string, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	if name == "" {
+		name = "Job"
+	}
+	if action == "" {
+		action = "Operation"
+	}
+	msg := fmt.Sprintf("❌ %s Failed: %s\nReason: %v", action, name, err)
+	slog.Warn("notifying user of operation failure", "action", action, "name", name, "error", err)
+
+	if target.PeerType != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, sendErr := ts.targetSender(target).Text(ctx, msg)
+		if sendErr != nil {
+			slog.Error("failed sending failure notification to user", "error", sendErr)
+		}
+	}
+}
+
+func (ts *TelegramService) sendJobFailure(job *Job, err error) {
+	if job == nil || err == nil || errors.Is(err, context.Canceled) || job.Status == "Cancelled" || job.State == StateCancelled {
+		return
+	}
+	name := job.FileName
+	action := string(job.Type)
+	ts.sendTargetFailure(job.Target, name, action, err)
+}
+
+func locationToStored(loc tg.InputFileLocationClass) *StoredLocation {
+	if loc == nil {
+		return nil
+	}
+	switch l := loc.(type) {
+	case *tg.InputDocumentFileLocation:
+		return &StoredLocation{
+			Type:          "doc",
+			ID:            l.ID,
+			AccessHash:    l.AccessHash,
+			FileReference: l.FileReference,
+		}
+	case *tg.InputPhotoFileLocation:
+		return &StoredLocation{
+			Type:          "photo",
+			ID:            l.ID,
+			AccessHash:    l.AccessHash,
+			FileReference: l.FileReference,
+			ThumbSize:     l.ThumbSize,
+		}
+	}
+	return nil
+}
+
+func storedToLocation(s *StoredLocation) tg.InputFileLocationClass {
+	if s == nil {
+		return nil
+	}
+	switch s.Type {
+	case "doc":
+		return &tg.InputDocumentFileLocation{
+			ID:            s.ID,
+			AccessHash:    s.AccessHash,
+			FileReference: s.FileReference,
+		}
+	case "photo":
+		return &tg.InputPhotoFileLocation{
+			ID:            s.ID,
+			AccessHash:    s.AccessHash,
+			FileReference: s.FileReference,
+			ThumbSize:     s.ThumbSize,
+		}
+	}
+	return nil
+}
+
 func extractPeerChannelInfo(peer tg.PeerClass, entities tg.Entities) (int64, int64) {
 	if p, ok := peer.(*tg.PeerChannel); ok {
 		var accessHash int64
@@ -723,9 +849,10 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 
 		fileName := ExtractFileName(rawURL, "")
 
+		target := extractJobTarget(msg, entities)
 		var jobRef *Job
 		execFunc := func() {
-			ts.executeURLMirrorJob(jobRef, rawURL, entities, update)
+			ts.executeURLMirrorJob(jobRef, rawURL)
 		}
 
 		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, 0, userID, execFunc)
@@ -734,10 +861,14 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 			return replyErr
 		}
+		job.Kind = "url_mirror"
+		job.Target = target
+		job.RawURL = rawURL
+		ts.jm.SaveState()
 		jobRef = job
 
 		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
-		go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+		go ts.startLiveStatusUpdater(target)
 		return nil
 	}
 
@@ -853,9 +984,10 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			continue
 		}
 
+		target := extractJobTarget(msg, entities)
 		var jobRef *Job
 		execFunc := func() {
-			ts.executeMirrorJob(jobRef, location, entities, update)
+			ts.executeMirrorJob(jobRef, location)
 		}
 
 		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID, execFunc)
@@ -863,6 +995,10 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			slog.Warn("could not create mirror job", "msg_id", targetID, "error", err)
 			continue
 		}
+		job.Kind = "tg_mirror"
+		job.Target = target
+		job.Location = locationToStored(location)
+		ts.jm.SaveState()
 		jobRef = job
 
 		queuedJobs++
@@ -873,13 +1009,13 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+	go ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
 
 	return nil
 }
 
 // sendMirrorCompletion sends the completion message with Name/Size/Type and a copy button for the index link.
-func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, job *Job, driveURL string) {
+func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, job *Job, driveURL string) {
 	baseURL := ts.cfg.IndexBaseURL
 	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
@@ -913,11 +1049,11 @@ func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, entities tg
 		)
 	}
 
-	msg := ts.sender.Reply(entities, update)
+	builder := ts.targetSender(job.Target)
 	if replyMarkup != nil {
-		msg = msg.Markup(replyMarkup)
+		builder = builder.Markup(replyMarkup)
 	}
-	_, _ = msg.StyledText(ctx, completionOpts...)
+	_, _ = builder.StyledText(ctx, completionOpts...)
 }
 
 func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLocationClass, error) {
@@ -957,7 +1093,7 @@ func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLo
 	}
 }
 
-func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities tg.Entities, update message.AnswerableMessageUpdate) {
+func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing URL mirror job", "job_id", job.ID, "url", rawURL, "mode", ts.cfg.DownloadMode)
@@ -976,16 +1112,17 @@ func (ts *TelegramService) executeURLMirrorJob(job *Job, rawURL string, entities
 	if err != nil {
 		slog.Error("gdrive upload failed for URL mirror", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
+		ts.sendJobFailure(job, err)
 		return
 	}
 
 	job.Status = "Completed"
 	slog.Info("URL mirror job completed", "job_id", job.ID, "drive_url", driveURL)
 
-	ts.sendMirrorCompletion(context.Background(), entities, update, job, driveURL)
+	ts.sendMirrorCompletion(context.Background(), job, driveURL)
 }
 
-func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass, entities tg.Entities, update message.AnswerableMessageUpdate) {
+func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocationClass) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing mirror job", "job_id", job.ID, "file_name", job.FileName, "file_size", job.Size, "mode", ts.cfg.DownloadMode)
@@ -1004,13 +1141,14 @@ func (ts *TelegramService) executeMirrorJob(job *Job, location tg.InputFileLocat
 	if err != nil {
 		slog.Error("mirror job failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
+		ts.sendJobFailure(job, err)
 		return
 	}
 
 	job.Status = "Completed"
 	slog.Info("mirror job completed", "job_id", job.ID, "drive_url", driveURL)
 
-	ts.sendMirrorCompletion(context.Background(), entities, update, job, driveURL)
+	ts.sendMirrorCompletion(context.Background(), job, driveURL)
 }
 
 func (ts *TelegramService) executeMirrorStream(job *Job, location tg.InputFileLocationClass) (string, error) {
@@ -1311,9 +1449,10 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		}
 	}
 
+	target := extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFunc := func() {
-		ts.executeLeechJob(jobRef, rawURL, entities, update)
+		ts.executeLeechJob(jobRef, rawURL)
 	}
 
 	fileName := ExtractFileName(rawURL, "")
@@ -1323,14 +1462,18 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 		return replyErr
 	}
+	job.Kind = "url_leech"
+	job.Target = target
+	job.RawURL = rawURL
+	ts.jm.SaveState()
 	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
-	go ts.startLiveStatusUpdater(context.Background(), entities, update, msg)
+	go ts.startLiveStatusUpdater(target)
 	return nil
 }
 
-func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.Entities, update message.AnswerableMessageUpdate) {
+func (ts *TelegramService) executeLeechJob(job *Job, rawURL string) {
 	defer ts.jm.FinishJob(job.ID)
 
 	slog.Info("executing leech job", "job_id", job.ID, "url", rawURL)
@@ -1341,12 +1484,22 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	if err != nil {
 		slog.Error("leech download failed", "job_id", job.ID, "error", err)
 		job.Status = fmt.Sprintf("Failed: %v", err)
+		ts.sendJobFailure(job, err)
 		return
 	}
 	defer body.Close()
 
 	job.FileName = fileName
 	job.Size = contentLength
+	ts.jm.SaveState()
+
+	if contentLength > 2*1024*1024*1024 {
+		sizeErr := fmt.Errorf("file size (%s) exceeds Telegram 2GB limit", FormatBytes(contentLength))
+		slog.Error("leech file exceeds 2GB limit", "job_id", job.ID, "size", contentLength)
+		job.Status = "Failed: exceeds 2GB"
+		ts.sendJobFailure(job, sizeErr)
+		return
+	}
 
 	progressReader := NewProgressReader(body, contentLength, func(read, total int64, speed float64, eta time.Duration) {
 		job.ReadBytes = read
@@ -1369,15 +1522,17 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string, entities tg.
 	if uploadErr != nil {
 		slog.Error("leech upload failed", "job_id", job.ID, "error", uploadErr)
 		job.Status = fmt.Sprintf("Failed: %v", uploadErr)
+		ts.sendJobFailure(job, uploadErr)
 		return
 	}
 
 	// Send uploaded file to the Telegram chat
 	mediaOpt := buildMediaOption(inputFile, fileName)
-	_, sendErr := ts.sender.Reply(entities, update).Media(context.Background(), mediaOpt)
+	_, sendErr := ts.targetSender(job.Target).Media(context.Background(), mediaOpt)
 	if sendErr != nil {
 		slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
 		job.Status = fmt.Sprintf("Failed delivering to chat: %v", sendErr)
+		ts.sendJobFailure(job, sendErr)
 		return
 	}
 
@@ -1502,4 +1657,108 @@ func extractFileNameFromURL(rawURL string) string {
 		return parts[len(parts)-1]
 	}
 	return "downloaded_file.bin"
+}
+
+func (ts *TelegramService) RecoverJobs(ctx context.Context) {
+	records, err := ts.jm.LoadPersistedState()
+	if err != nil {
+		slog.Error("failed loading persisted jobs for recovery", "error", err)
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+
+	slog.Info("recovering unfinished jobs from previous session", "count", len(records))
+
+	for _, rec := range records {
+		r := rec
+		switch r.Kind {
+		case "url_mirror", "url_leech":
+			if r.RawURL == "" {
+				ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), errors.New("missing source URL"))
+				ts.jm.RemovePersistedJob(r.ID)
+				continue
+			}
+			probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
+			req, pErr := http.NewRequestWithContext(probeCtx, http.MethodHead, r.RawURL, nil)
+			var resp *http.Response
+			if pErr == nil {
+				req.Header.Set("User-Agent", "Mozilla/5.0")
+				resp, pErr = http.DefaultClient.Do(req)
+			}
+			probeCancel()
+			if pErr != nil || (resp != nil && resp.StatusCode >= 400 && resp.StatusCode != http.StatusMethodNotAllowed) {
+				var failReason error
+				if pErr != nil {
+					failReason = pErr
+				} else if resp != nil {
+					failReason = fmt.Errorf("source HTTP %s", resp.Status)
+				}
+				ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), fmt.Errorf("source URL unreachable on recovery: %w", failReason))
+				ts.jm.RemovePersistedJob(r.ID)
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				continue
+			}
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+
+		case "torrent_mirror", "torrent_leech":
+			if ts.torrentSvc == nil {
+				ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), errors.New("torrent engine is disabled"))
+				ts.jm.RemovePersistedJob(r.ID)
+				continue
+			}
+			if r.MagnetURI == "" && len(r.TorrentBytes) == 0 {
+				ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), errors.New("missing torrent source data"))
+				ts.jm.RemovePersistedJob(r.ID)
+				continue
+			}
+
+		case "tg_mirror":
+			if r.Location == nil {
+				ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), errors.New("missing media file location"))
+				ts.jm.RemovePersistedJob(r.ID)
+				continue
+			}
+		}
+
+		notice := fmt.Sprintf("🔄 Bot restarted. Resuming job %s: %s", r.ID, r.FileName)
+		noticeCtx, noticeCancel := context.WithTimeout(ctx, 10*time.Second)
+		_, _ = ts.targetSender(r.Target).Text(noticeCtx, notice)
+		noticeCancel()
+
+		go ts.startLiveStatusUpdater(r.Target)
+
+		var jobRef *Job
+		var execFunc func()
+		switch r.Kind {
+		case "url_mirror":
+			execFunc = func() { ts.executeURLMirrorJob(jobRef, r.RawURL) }
+		case "url_leech":
+			execFunc = func() { ts.executeLeechJob(jobRef, r.RawURL) }
+		case "tg_mirror":
+			execFunc = func() { ts.executeMirrorJob(jobRef, storedToLocation(r.Location)) }
+		case "torrent_mirror":
+			execFunc = func() { ts.executeTorrentMirrorJob(jobRef, r.MagnetURI, r.TorrentBytes) }
+		case "torrent_leech":
+			execFunc = func() { ts.executeTorrentLeechJob(jobRef, r.MagnetURI, r.TorrentBytes) }
+		default:
+			ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), fmt.Errorf("unknown job kind: %s", r.Kind))
+			ts.jm.RemovePersistedJob(r.ID)
+			continue
+		}
+
+		job, err := ts.jm.CreateRecoveredJob(ctx, r, execFunc)
+		if err != nil {
+			slog.Error("failed recreating recovered job", "job_id", r.ID, "error", err)
+			ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), fmt.Errorf("failed recovering job: %w", err))
+			ts.jm.RemovePersistedJob(r.ID)
+			continue
+		}
+		jobRef = job
+	}
 }

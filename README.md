@@ -90,6 +90,7 @@ See `example.config.json` for all available options.
 | `allowed_chat_id` | Authorized Telegram user IDs (for DMs) or group/channel IDs | `[]` |
 | `max_concurrency` | Max simultaneous transfers | `3` |
 | `status_refresh_delay_sec` | Status message update interval (seconds) | `5` |
+| `job_state_file` | Persistence file for restart resume | `jobs_state.json` |
 
 ## Docker
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/gotd/contrib/middleware/ratelimit"
@@ -31,6 +32,8 @@ func main() {
 	}
 
 	jm := NewJobManager(cfg.MaxConcurrency)
+	jm.SetStateFile(cfg.JobStateFile)
+	cleanOrphanedTempFiles()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -81,6 +84,7 @@ func main() {
 	go func() {
 		errCh <- client.Run(ctx, func(ctx context.Context) error {
 			slog.Info("Zenith-Mirror bot engine running and listening for commands")
+			go ts.RecoverJobs(ctx)
 			<-ctx.Done()
 			return nil
 		})
@@ -89,12 +93,22 @@ func main() {
 	select {
 	case <-ctx.Done():
 		slog.Info("shutdown signal received")
-		jm.CancelAllJobs()
+		jm.Stop()
 		ts.ClosePools()
+		cleanOrphanedTempFiles()
 		slog.Info("graceful shutdown complete")
 	case err := <-errCh:
 		if err != nil {
 			slog.Error("service exited with error", "error", err)
+		}
+	}
+}
+
+func cleanOrphanedTempFiles() {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "zenith-dl-*"))
+	if err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
 		}
 	}
 }

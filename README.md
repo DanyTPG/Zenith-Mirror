@@ -87,7 +87,7 @@ See `example.config.json` for all available options.
 | `rpc_burst` | Rate limiter token bucket burst | `5` |
 | `rpc_rate_per_sec` | Rate limiter sustained RPCs/sec | `10` |
 | `owner_id` | Telegram user ID of the bot owner | - |
-| `allowed_user_ids` | Additional authorized user IDs | - |
+| `allowed_chat_id` | Authorized Telegram user IDs (for DMs) or group/channel IDs | `[]` |
 | `max_concurrency` | Max simultaneous transfers | `3` |
 | `status_refresh_delay_sec` | Status message update interval (seconds) | `5` |
 

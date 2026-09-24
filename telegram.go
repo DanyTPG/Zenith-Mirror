@@ -98,10 +98,15 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	}
 
 	userID := ts.getUserID(msg)
-	if !ts.isAuthorized(userID) {
-		slog.Warn("unauthorized user access attempt", "user_id", userID, "text", text)
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Unauthorized user.")
-		return err
+	authorized, isDM := ts.checkAuthorization(msg)
+	if !authorized {
+		if isDM {
+			slog.Warn("unauthorized DM access attempt", "user_id", userID, "text", text)
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "You are not authorized to use this bot.")
+			return err
+		}
+		slog.Debug("ignoring message from unauthorized group/channel", "peer", msg.PeerID, "user_id", userID)
+		return nil
 	}
 
 	if strings.HasPrefix(text, "/start") {
@@ -167,16 +172,30 @@ func (ts *TelegramService) getUserID(msg *tg.Message) int64 {
 	return 0
 }
 
+func (ts *TelegramService) checkAuthorization(msg *tg.Message) (bool, bool) {
+	userID := ts.getUserID(msg)
+	isOwner := ts.cfg.IsOwner(userID)
+
+	switch p := msg.PeerID.(type) {
+	case *tg.PeerUser:
+		// Direct Message: user ID must match owner or be in allowed_chat_id
+		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.UserID) || (userID != 0 && ts.cfg.IsChatAllowed(userID))
+		return isAllowed, true
+	case *tg.PeerChat:
+		// Group Chat: reply to anyone if group chat ID is allowed (or sender is owner)
+		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.ChatID)
+		return isAllowed, false
+	case *tg.PeerChannel:
+		// Supergroup or channel: reply to anyone if channel ID is allowed (or sender is owner)
+		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.ChannelID)
+		return isAllowed, false
+	default:
+		return isOwner, false
+	}
+}
+
 func (ts *TelegramService) isAuthorized(userID int64) bool {
-	if len(ts.cfg.AuthorizedUsers) == 0 {
-		return true
-	}
-	for _, id := range ts.cfg.AuthorizedUsers {
-		if id == userID {
-			return true
-		}
-	}
-	return false
+	return ts.cfg.IsAllowed(userID)
 }
 
 func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string) error {

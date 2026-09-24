@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -25,8 +27,10 @@ type Config struct {
 	RPCBurst               int     `json:"rpc_burst"`        // rate limiter: token bucket burst (default 5)
 	RPCRatePerSec          float64 `json:"rpc_rate_per_sec"` // rate limiter: sustained RPCs/sec (default 10)
 	OwnerID                int64   `json:"owner_id"`
-	AllowedUserIDs         []int64 `json:"allowed_user_ids"`
-	AuthorizedUsers        []int64 `json:"authorized_users"` // alias for AllowedUserIDs
+	AllowedChatID          []int64 `json:"allowed_chat_id"`
+	AllowedChatIDs         []int64 `json:"allowed_chat_ids"`         // alias for AllowedChatID
+	AllowedUserIDs         []int64 `json:"allowed_user_ids"`         // legacy alias
+	AuthorizedUsers        []int64 `json:"authorized_users"`        // legacy alias
 	MaxConcurrency         int     `json:"max_concurrency"`
 	LogFile                string  `json:"log_file"`
 	StatusRefreshDelaySec  int     `json:"status_refresh_delay_sec"`
@@ -106,17 +110,73 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.TorrentListenPort = 0
 	}
 
+	// Merge all allowed chat ID variations
+	seen := make(map[int64]bool)
+	var merged []int64
+	addID := func(id int64) {
+		if id != 0 && !seen[id] {
+			seen[id] = true
+			merged = append(merged, id)
+		}
+	}
+	for _, id := range cfg.AllowedChatID {
+		addID(id)
+	}
+	for _, id := range cfg.AllowedChatIDs {
+		addID(id)
+	}
+	for _, id := range cfg.AllowedUserIDs {
+		addID(id)
+	}
+	for _, id := range cfg.AuthorizedUsers {
+		addID(id)
+	}
+	cfg.AllowedChatID = merged
+	cfg.AllowedChatIDs = merged
+	cfg.AllowedUserIDs = merged
+	cfg.AuthorizedUsers = merged
+
 	return &cfg, nil
 }
 
-func (c *Config) IsAllowed(userID int64) bool {
-	if c.OwnerID != 0 && userID == c.OwnerID {
-		return true
+func (c *Config) IsOwner(userID int64) bool {
+	return c.OwnerID != 0 && userID == c.OwnerID
+}
+
+func (c *Config) IsChatAllowed(chatID int64) bool {
+	if chatID == 0 {
+		return false
 	}
-	for _, id := range c.AllowedUserIDs {
-		if id == userID {
+	for _, id := range c.AllowedChatID {
+		if matchChatID(id, chatID) {
 			return true
 		}
 	}
 	return false
+}
+
+func (c *Config) IsAllowed(id int64) bool {
+	return c.IsOwner(id) || c.IsChatAllowed(id)
+}
+
+func matchChatID(configured int64, peerID int64) bool {
+	if configured == peerID {
+		return true
+	}
+	if configured == -peerID || -configured == peerID {
+		return true
+	}
+	sConfig := strconv.FormatInt(configured, 10)
+	sPeer := strconv.FormatInt(peerID, 10)
+
+	norm := func(s string) string {
+		if strings.HasPrefix(s, "-100") {
+			return s[4:]
+		}
+		if strings.HasPrefix(s, "-") {
+			return s[1:]
+		}
+		return s
+	}
+	return norm(sConfig) == norm(sPeer)
 }

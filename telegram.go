@@ -560,11 +560,7 @@ func (ts *TelegramService) startLiveStatusUpdater(target JobTarget) {
 
 	peer := ts.inputPeerFromTarget(target)
 	opts := ts.buildStatusStyledText()
-	builder := ts.sender.To(peer)
-	if target.ReplyMsgID > 0 {
-		builder = builder.Reply(target.ReplyMsgID)
-	}
-	updates, err := builder.StyledText(context.Background(), opts...)
+	updates, err := ts.targetSender(target).StyledText(context.Background(), opts...)
 	if err != nil {
 		slog.Error("failed sending initial live status message", "error", err)
 		return
@@ -697,7 +693,7 @@ func (ts *TelegramService) inputPeerFromTarget(target JobTarget) tg.InputPeerCla
 
 func (ts *TelegramService) targetSender(target JobTarget) *message.Builder {
 	peer := ts.inputPeerFromTarget(target)
-	builder := ts.sender.To(peer)
+	builder := ts.sender.To(peer).CloneBuilder()
 	if target.ReplyMsgID > 0 {
 		builder = builder.Reply(target.ReplyMsgID)
 	}

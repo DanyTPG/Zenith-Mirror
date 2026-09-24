@@ -94,3 +94,35 @@ func TestAllowedChatID(t *testing.T) {
 		t.Errorf("unauthorized chat should not be allowed")
 	}
 }
+
+func TestMultipleOwners(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	content := `{
+		"app_id": 12345,
+		"app_hash": "dummy_hash",
+		"bot_token": "dummy_bot_token",
+		"owner_id": [777, 888, 999],
+		"allowed_chat_id": [103663594]
+	}`
+
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !cfg.IsOwner(777) || !cfg.IsOwner(888) || !cfg.IsOwner(999) {
+		t.Errorf("expected all 777, 888, 999 to be owners")
+	}
+	if cfg.IsOwner(103663594) {
+		t.Errorf("did not expect 103663594 to be owner")
+	}
+	if !cfg.IsAllowed(777) || !cfg.IsAllowed(888) || !cfg.IsAllowed(999) {
+		t.Errorf("owners must be allowed")
+	}
+}

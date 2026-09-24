@@ -86,7 +86,7 @@ See `example.config.json` for all available options.
 | `torrent_listen_port` | Inbound BitTorrent TCP/UDP listening port (0 for random) | `0` |
 | `rpc_burst` | Rate limiter token bucket burst | `5` |
 | `rpc_rate_per_sec` | Rate limiter sustained RPCs/sec | `10` |
-| `owner_id` | Telegram user ID of the bot owner | - |
+| `owner_id` | Telegram user ID(s) of the bot owner(s) (single ID or array) | `[]` |
 | `allowed_chat_id` | Authorized Telegram user IDs (for DMs) or group/channel IDs | `[]` |
 | `max_concurrency` | Max simultaneous transfers | `3` |
 | `status_refresh_delay_sec` | Status message update interval (seconds) | `5` |

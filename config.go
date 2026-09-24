@@ -10,33 +10,56 @@ import (
 	"time"
 )
 
+type Int64List []int64
+
+func (l *Int64List) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var single int64
+	if err := json.Unmarshal(data, &single); err == nil {
+		if single != 0 {
+			*l = []int64{single}
+		}
+		return nil
+	}
+	var arr []int64
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*l = arr
+		return nil
+	}
+	return fmt.Errorf("expected int64 or []int64, got %s", trimmed)
+}
+
 type Config struct {
-	AppID                  int     `json:"app_id"`
-	AppHash                string  `json:"app_hash"`
-	BotToken               string  `json:"bot_token"`
-	SessionFile            string  `json:"session_file"`
-	GDriveCredentialsFile  string  `json:"gdrive_credentials_file"`
-	GDriveTokenFile        string  `json:"gdrive_token_file"`
-	GDriveFolderID         string  `json:"gdrive_folder_id"`
-	IndexBaseURL           string  `json:"index_base_url"`
-	DownloadMode           string  `json:"download_mode"`    // "stream" (zero-disk) or "parallel" (temp file, faster)
-	DownloadThreads        int     `json:"download_threads"` // threads for parallel mode (default 4)
-	PartSize               int     `json:"part_size"`        // chunk size in bytes, multiple of 4096 (default 524288)
-	MaxConcurrentDownloads int     `json:"max_concurrent_downloads"` // global cap on simultaneous file downloads (default 4)
+	AppID                  int       `json:"app_id"`
+	AppHash                string    `json:"app_hash"`
+	BotToken               string    `json:"bot_token"`
+	SessionFile            string    `json:"session_file"`
+	GDriveCredentialsFile  string    `json:"gdrive_credentials_file"`
+	GDriveTokenFile        string    `json:"gdrive_token_file"`
+	GDriveFolderID         string    `json:"gdrive_folder_id"`
+	IndexBaseURL           string    `json:"index_base_url"`
+	DownloadMode           string    `json:"download_mode"`    // "stream" (zero-disk) or "parallel" (temp file, faster)
+	DownloadThreads        int       `json:"download_threads"` // threads for parallel mode (default 4)
+	PartSize               int       `json:"part_size"`        // chunk size in bytes, multiple of 4096 (default 524288)
+	MaxConcurrentDownloads int       `json:"max_concurrent_downloads"` // global cap on simultaneous file downloads (default 4)
 	RPCDelay               time.Duration `json:"-"`          // rate limiter: min interval between RPCs
-	RPCBurst               int     `json:"rpc_burst"`        // rate limiter: token bucket burst (default 5)
-	RPCRatePerSec          float64 `json:"rpc_rate_per_sec"` // rate limiter: sustained RPCs/sec (default 10)
-	OwnerID                int64   `json:"owner_id"`
-	AllowedChatID          []int64 `json:"allowed_chat_id"`
-	AllowedChatIDs         []int64 `json:"allowed_chat_ids"`         // alias for AllowedChatID
-	AllowedUserIDs         []int64 `json:"allowed_user_ids"`         // legacy alias
-	AuthorizedUsers        []int64 `json:"authorized_users"`        // legacy alias
-	MaxConcurrency         int     `json:"max_concurrency"`
-	LogFile                string  `json:"log_file"`
-	StatusRefreshDelaySec  int     `json:"status_refresh_delay_sec"`
-	StatusRefreshDelay     int     `json:"-"`
-	TorrentDownloadDir     string  `json:"torrent_download_dir"`  // temp dir for torrent pieces (default "torrent_downloads")
-	TorrentListenPort      int     `json:"torrent_listen_port"`   // DHT listen port (default 0 = random)
+	RPCBurst               int       `json:"rpc_burst"`        // rate limiter: token bucket burst (default 5)
+	RPCRatePerSec          float64   `json:"rpc_rate_per_sec"` // rate limiter: sustained RPCs/sec (default 10)
+	OwnerID                Int64List `json:"owner_id"`
+	OwnerIDs               Int64List `json:"owner_ids"`                // alias for OwnerID
+	AllowedChatID          Int64List `json:"allowed_chat_id"`
+	AllowedChatIDs         Int64List `json:"allowed_chat_ids"`         // alias for AllowedChatID
+	AllowedUserIDs         Int64List `json:"allowed_user_ids"`         // legacy alias
+	AuthorizedUsers        Int64List `json:"authorized_users"`        // legacy alias
+	MaxConcurrency         int       `json:"max_concurrency"`
+	LogFile                string    `json:"log_file"`
+	StatusRefreshDelaySec  int       `json:"status_refresh_delay_sec"`
+	StatusRefreshDelay     int       `json:"-"`
+	TorrentDownloadDir     string    `json:"torrent_download_dir"`  // temp dir for torrent pieces (default "torrent_downloads")
+	TorrentListenPort      int       `json:"torrent_listen_port"`   // DHT listen port (default 0 = random)
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -136,11 +159,37 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.AllowedUserIDs = merged
 	cfg.AuthorizedUsers = merged
 
+	// Merge all owner ID variations
+	seenOwner := make(map[int64]bool)
+	var mergedOwners []int64
+	addOwner := func(id int64) {
+		if id != 0 && !seenOwner[id] {
+			seenOwner[id] = true
+			mergedOwners = append(mergedOwners, id)
+		}
+	}
+	for _, id := range cfg.OwnerID {
+		addOwner(id)
+	}
+	for _, id := range cfg.OwnerIDs {
+		addOwner(id)
+	}
+	cfg.OwnerID = mergedOwners
+	cfg.OwnerIDs = mergedOwners
+
 	return &cfg, nil
 }
 
 func (c *Config) IsOwner(userID int64) bool {
-	return c.OwnerID != 0 && userID == c.OwnerID
+	if userID == 0 {
+		return false
+	}
+	for _, id := range c.OwnerID {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) IsChatAllowed(chatID int64) bool {

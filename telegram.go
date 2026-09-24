@@ -211,7 +211,7 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
 		ts.deleteLastStatus()
 		if ts.jm.GetActiveJobCount() > 0 {
-			go ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
+			go ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
 		} else {
 			opts := ts.buildStatusStyledText()
 			updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
@@ -424,7 +424,7 @@ func (ts *TelegramService) handleStatus(ctx context.Context, entities tg.Entitie
 
 	// Jobs active — run the same live updater the jobs use, so the status
 	// keeps refreshing until all jobs finish, then deletes itself.
-	ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
+	ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
 	return nil
 }
 
@@ -660,10 +660,10 @@ func (ts *TelegramService) buildInputPeer(peer tg.PeerClass, channelID int64, ac
 	}
 }
 
-func extractJobTarget(msg *tg.Message, entities tg.Entities) JobTarget {
+func (ts *TelegramService) extractJobTarget(msg *tg.Message, entities tg.Entities) JobTarget {
 	target := JobTarget{
 		ReplyMsgID: msg.ID,
-		UserID:     extractUserID(msg),
+		UserID:     ts.getUserID(msg),
 	}
 	switch p := msg.PeerID.(type) {
 	case *tg.PeerUser:
@@ -849,7 +849,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 
 		fileName := ExtractFileName(rawURL, "")
 
-		target := extractJobTarget(msg, entities)
+		target := ts.extractJobTarget(msg, entities)
 		var jobRef *Job
 		execFunc := func() {
 			ts.executeURLMirrorJob(jobRef, rawURL)
@@ -984,7 +984,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			continue
 		}
 
-		target := extractJobTarget(msg, entities)
+		target := ts.extractJobTarget(msg, entities)
 		var jobRef *Job
 		execFunc := func() {
 			ts.executeMirrorJob(jobRef, location)
@@ -1009,7 +1009,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		return err
 	}
 
-	go ts.startLiveStatusUpdater(extractJobTarget(msg, entities))
+	go ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
 
 	return nil
 }
@@ -1449,7 +1449,7 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		}
 	}
 
-	target := extractJobTarget(msg, entities)
+	target := ts.extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFunc := func() {
 		ts.executeLeechJob(jobRef, rawURL)

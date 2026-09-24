@@ -45,7 +45,7 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 			displayName = displayName[:60] + "..."
 		}
 	}
-	target := extractJobTarget(msg, entities)
+	target := ts.extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFn := func() {
 		ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes)
@@ -91,7 +91,7 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	if strings.HasPrefix(displayName, "magnet:?") && len(displayName) > 60 {
 		displayName = displayName[:60] + "..."
 	}
-	target := extractJobTarget(msg, entities)
+	target := ts.extractJobTarget(msg, entities)
 	var jobRef *Job
 	execFn := func() {
 		ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes)

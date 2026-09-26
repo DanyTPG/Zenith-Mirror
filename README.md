@@ -91,6 +91,25 @@ See `example.config.json` for all available options.
 | `max_concurrency` | Max simultaneous transfers | `3` |
 | `status_refresh_delay_sec` | Status message update interval (seconds) | `5` |
 | `job_state_file` | Persistence file for restart resume | `jobs_state.json` |
+| `feed_state_file` | Persistence file for RSS/Atom subscriptions | `feeds_state.json` |
+| `feed_check_interval_sec` | Background scan interval for RSS feeds | `600` |
+
+### Commands
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `/mirror` | `/mirror <url>` or reply to file / `.torrent` | Mirror to Google Drive |
+| `/leech` | `/leech <url>` or magnet | Leech to Telegram |
+| `/feed` | `/feed add [mirror\|leech\|notify] [NAME] [URL] [+include] [-exclude]` | Subscribe to RSS/Atom release feed |
+| `/feed list` | `/feed list` | View active subscriptions with interactive inline buttons |
+| `/feed pause` | `/feed pause <id\|name>` | Pause background monitoring for feed |
+| `/feed resume` | `/feed resume <id\|name>` | Resume background monitoring for feed |
+| `/feed delete` | `/feed delete <id\|name>` | Delete feed subscription |
+| `/feed check` | `/feed check [id\|name]` | Trigger immediate scan |
+| `/status` | `/status` | View active transfer jobs |
+| `/cancel` | `/cancel <id>` | Cancel active job |
+| `/stats` | `/stats` | View resource and transfer statistics |
+| `/help` | `/help` | Show command usage |
 
 ## Docker
 

@@ -19,5 +19,7 @@
   "allowed_chat_id": [987654321, -1001234567890],
   "max_concurrency": 3,
   "status_refresh_delay_sec": 10,
-  "job_state_file": "jobs_state.json"
+  "job_state_file": "jobs_state.json",
+  "feed_state_file": "feeds_state.json",
+  "feed_check_interval_sec": 600
 }

@@ -51,6 +51,7 @@ type TelegramService struct {
 		invoker tg.Invoker
 		closer  io.Closer
 	}
+	feedMgr *FeedManager
 }
 
 func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
@@ -67,6 +68,7 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 			closer  io.Closer
 		}),
 	}
+	ts.feedMgr = NewFeedManager(cfg.FeedStateFile, ts)
 	ts.downloader = NewLeechPipeline(ts)
 	return ts
 }
@@ -90,6 +92,10 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 			return nil
 		}
 		return ts.handleIncomingMessage(ctx, entities, update, msg)
+	})
+
+	dispatcher.OnBotCallbackQuery(func(ctx context.Context, entities tg.Entities, update *tg.UpdateBotCallbackQuery) error {
+		return ts.handleBotCallbackQuery(ctx, entities, update)
 	})
 }
 
@@ -121,6 +127,8 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
 			"/mirror magnet:?xt=... OR reply to .torrent with /mirror - Torrent to Drive\n" +
 			"/leech <url> OR magnet:?xt=... - Leech to Telegram\n" +
+			"/feed - Manage RSS/Atom release feeds\n" +
+			"/feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n" +
 			"/status - View active transfer jobs\n" +
 			"/cancel <id> - Cancel an active job\n" +
 			"/stats - View system performance and resource usage\n" +
@@ -155,6 +163,10 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 
 	if strings.HasPrefix(text, "/leech") {
 		return ts.handleLeech(ctx, entities, update, msg, text, userID)
+	}
+
+	if strings.HasPrefix(text, "/feed") {
+		return ts.handleFeed(ctx, entities, update, msg, text, userID)
 	}
 
 	return nil
@@ -1758,3 +1770,476 @@ func (ts *TelegramService) RecoverJobs(ctx context.Context) {
 		jobRef = job
 	}
 }
+
+func (ts *TelegramService) StartFeedWorker(ctx context.Context, interval time.Duration) {
+	if ts.feedMgr != nil {
+		go ts.feedMgr.StartBackgroundPoller(ctx, interval)
+	}
+}
+
+func (ts *TelegramService) handleBotCallbackQuery(ctx context.Context, entities tg.Entities, u *tg.UpdateBotCallbackQuery) error {
+	data := string(u.Data)
+	if strings.HasPrefix(data, "feed:") {
+		return ts.handleFeedCallback(ctx, entities, u)
+	}
+	return nil
+}
+
+func (ts *TelegramService) handleFeedCallback(ctx context.Context, entities tg.Entities, u *tg.UpdateBotCallbackQuery) error {
+	data := string(u.Data)
+	parts := strings.Split(data, ":")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	action := parts[1]
+	isOwner := ts.cfg.IsOwner(u.UserID)
+	toast := ""
+
+	switch action {
+	case "pause":
+		if len(parts) >= 3 {
+			id, _ := strconv.Atoi(parts[2])
+			feed, err := ts.feedMgr.PauseFeed(id, u.UserID, isOwner)
+			if err != nil {
+				toast = err.Error()
+			} else {
+				toast = fmt.Sprintf("Paused #%d (%s)", feed.ID, feed.Name)
+			}
+		}
+	case "resume":
+		if len(parts) >= 3 {
+			id, _ := strconv.Atoi(parts[2])
+			feed, err := ts.feedMgr.ResumeFeed(id, u.UserID, isOwner)
+			if err != nil {
+				toast = err.Error()
+			} else {
+				toast = fmt.Sprintf("Resumed #%d (%s)", feed.ID, feed.Name)
+			}
+		}
+	case "del":
+		if len(parts) >= 3 {
+			id, _ := strconv.Atoi(parts[2])
+			feed, err := ts.feedMgr.DeleteFeed(id, u.UserID, isOwner)
+			if err != nil {
+				toast = err.Error()
+			} else {
+				toast = fmt.Sprintf("Deleted #%d (%s)", feed.ID, feed.Name)
+			}
+		}
+	case "run":
+		if len(parts) >= 3 {
+			id, _ := strconv.Atoi(parts[2])
+			feed := ts.feedMgr.GetFeed(parts[2], u.UserID, isOwner)
+			if feed == nil {
+				toast = "Feed not found"
+			} else {
+				toast = fmt.Sprintf("Checking #%d (%s)...", feed.ID, feed.Name)
+				go func() {
+					checkCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+					defer cancel()
+					_, _ = ts.feedMgr.CheckFeed(checkCtx, feed)
+				}()
+			}
+		}
+	case "list":
+		toast = "Refreshed."
+	}
+
+	req := &tg.MessagesSetBotCallbackAnswerRequest{
+		QueryID: u.QueryID,
+	}
+	if toast != "" {
+		req.SetMessage(toast)
+	}
+	_, _ = ts.client.API().MessagesSetBotCallbackAnswer(ctx, req)
+
+	channelID, accessHash := extractPeerChannelInfo(u.Peer, entities)
+	peer := ts.buildInputPeer(u.Peer, channelID, accessHash)
+	text, feedMarkup := ts.buildFeedListMessage(u.UserID, isOwner)
+	builder := ts.sender.To(peer).Edit(u.MsgID)
+	if feedMarkup != nil {
+		builder = builder.Markup(feedMarkup)
+	}
+	_, _ = builder.Text(ctx, text)
+	return nil
+}
+
+func (ts *TelegramService) handleFeed(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
+	args := strings.Fields(text)
+	isOwner := ts.cfg.IsOwner(userID)
+
+	if len(args) == 1 || args[1] == "help" {
+		feeds := ts.feedMgr.ListFeeds(userID, isOwner)
+		if len(feeds) > 0 {
+			msgText, feedMarkup := ts.buildFeedListMessage(userID, isOwner)
+			builder := ts.sender.Reply(entities, update)
+			if feedMarkup != nil {
+				builder = builder.Markup(feedMarkup)
+			}
+			_, err := builder.Text(ctx, msgText)
+			return err
+		}
+
+		helpMsg := "📡 RSS / Atom Feed Automation\n\n" +
+			"Commands:\n" +
+			"• /feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n" +
+			"• /feed list - View active feeds with interactive buttons\n" +
+			"• /feed pause <id|name> - Pause a feed\n" +
+			"• /feed resume <id|name> - Resume a paused feed\n" +
+			"• /feed delete <id|name> - Delete a feed\n" +
+			"• /feed check [id|name] - Trigger immediate scan\n\n" +
+			"Filter Syntax:\n" +
+			"• +1080p,2160p = Must contain 1080p OR 2160p\n" +
+			"• +Remux = Must also contain Remux\n" +
+			"• -CAM,TeleSync = Exclude if either matches\n\n" +
+			"Example:\n" +
+			"/feed add mirror movies https://feed.com/rss +1080p,2160p +Remux -CAM,TeleSync"
+		_, err := ts.sender.Reply(entities, update).Text(ctx, helpMsg)
+		return err
+	}
+
+	sub := strings.ToLower(args[1])
+	switch sub {
+	case "list":
+		msgText, feedMarkup := ts.buildFeedListMessage(userID, isOwner)
+		builder := ts.sender.Reply(entities, update)
+		if feedMarkup != nil {
+			builder = builder.Markup(feedMarkup)
+		}
+		_, err := builder.Text(ctx, msgText)
+		return err
+
+	case "add":
+		// Format: /feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]
+		if len(args) < 5 {
+			usage := "Usage: /feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n\n" +
+				"Example:\n" +
+				"/feed add mirror movies https://feed.com/rss +1080p,2160p +Remux -CAM,TeleSync"
+			_, err := ts.sender.Reply(entities, update).Text(ctx, usage)
+			return err
+		}
+
+		mode := FeedMode(strings.ToLower(args[2]))
+		name := args[3]
+		rawURL := args[4]
+
+		var includes []string
+		var excludes []string
+		for i := 5; i < len(args); i++ {
+			tok := args[i]
+			if strings.HasPrefix(tok, "+") {
+				clean := strings.TrimPrefix(tok, "+")
+				if clean != "" {
+					includes = append(includes, clean)
+				}
+			} else if strings.HasPrefix(tok, "-") {
+				clean := strings.TrimPrefix(tok, "-")
+				if clean != "" {
+					excludes = append(excludes, clean)
+				}
+			}
+		}
+
+		target := ts.extractJobTarget(msg, entities)
+		feed, err := ts.feedMgr.AddFeed(ctx, mode, name, rawURL, includes, excludes, userID, target)
+		if err != nil {
+			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("❌ Failed to add feed: %v", err))
+			return replyErr
+		}
+
+		replyText := fmt.Sprintf("✅ Feed Added: #%d %s\nMode: %s\nURL: %s\nIncludes: %v\nExcludes: %v\n\nBaseline snapshot set to newest item: %q.\nFuture matches will trigger automatically.",
+			feed.ID, feed.Name, strings.ToUpper(string(feed.Mode)), feed.URL, feed.Includes, feed.Excludes, feed.LastTitle)
+
+		var rows []tg.KeyboardButtonRow
+		btnPause := markup.Callback(fmt.Sprintf("⏸ Pause #%d", feed.ID), []byte(fmt.Sprintf("feed:pause:%d", feed.ID)))
+		btnRun := markup.Callback(fmt.Sprintf("⚡ Check #%d", feed.ID), []byte(fmt.Sprintf("feed:run:%d", feed.ID)))
+		btnDel := markup.Callback(fmt.Sprintf("🗑 Del #%d", feed.ID), []byte(fmt.Sprintf("feed:del:%d", feed.ID)))
+		rows = append(rows, markup.Row(btnPause, btnRun, btnDel))
+
+		builder := ts.sender.Reply(entities, update).Markup(markup.InlineKeyboard(rows...))
+		_, err = builder.Text(ctx, replyText)
+		return err
+
+	case "pause":
+		if len(args) < 3 {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /feed pause <id|name>")
+			return err
+		}
+		targetFeed := ts.feedMgr.GetFeed(args[2], userID, isOwner)
+		if targetFeed == nil {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Feed %q not found.", args[2]))
+			return err
+		}
+		f, err := ts.feedMgr.PauseFeed(targetFeed.ID, userID, isOwner)
+		if err != nil {
+			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error: %v", err))
+			return replyErr
+		}
+		_, err = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("⏸ Paused feed #%d (%s).", f.ID, f.Name))
+		return err
+
+	case "resume":
+		if len(args) < 3 {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /feed resume <id|name>")
+			return err
+		}
+		targetFeed := ts.feedMgr.GetFeed(args[2], userID, isOwner)
+		if targetFeed == nil {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Feed %q not found.", args[2]))
+			return err
+		}
+		f, err := ts.feedMgr.ResumeFeed(targetFeed.ID, userID, isOwner)
+		if err != nil {
+			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error: %v", err))
+			return replyErr
+		}
+		_, err = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("▶ Resumed feed #%d (%s).", f.ID, f.Name))
+		return err
+
+	case "delete", "del", "remove", "rm":
+		if len(args) < 3 {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /feed delete <id|name>")
+			return err
+		}
+		targetFeed := ts.feedMgr.GetFeed(args[2], userID, isOwner)
+		if targetFeed == nil {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Feed %q not found.", args[2]))
+			return err
+		}
+		f, err := ts.feedMgr.DeleteFeed(targetFeed.ID, userID, isOwner)
+		if err != nil {
+			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error: %v", err))
+			return replyErr
+		}
+		_, err = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("🗑 Deleted feed #%d (%s).", f.ID, f.Name))
+		return err
+
+	case "check", "run":
+		if len(args) >= 3 {
+			targetFeed := ts.feedMgr.GetFeed(args[2], userID, isOwner)
+			if targetFeed == nil {
+				_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Feed %q not found.", args[2]))
+				return err
+			}
+			count, err := ts.feedMgr.CheckFeed(ctx, targetFeed)
+			if err != nil {
+				_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("❌ Check failed for #%d: %v", targetFeed.ID, err))
+				return replyErr
+			}
+			_, err = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("⚡ Feed #%d checked. %d new item(s) matched and queued.", targetFeed.ID, count))
+			return err
+		}
+
+		userFeeds := ts.feedMgr.ListFeeds(userID, isOwner)
+		if len(userFeeds) == 0 {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "No feeds to check.")
+			return err
+		}
+		totalMatches := 0
+		for _, f := range userFeeds {
+			if !f.Paused {
+				m, _ := ts.feedMgr.CheckFeed(ctx, f)
+				totalMatches += m
+			}
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("⚡ Checked %d active feeds. Total %d new matches queued.", len(userFeeds), totalMatches))
+		return err
+
+	default:
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Unknown subcommand %q. Use /feed help", sub))
+		return err
+	}
+}
+
+func (ts *TelegramService) buildFeedListMessage(userID int64, isOwner bool) (string, tg.ReplyMarkupClass) {
+	feeds := ts.feedMgr.ListFeeds(userID, isOwner)
+	if len(feeds) == 0 {
+		text := "📡 No RSS/Feed subscriptions found.\n\n" +
+			"Add one with:\n" +
+			"/feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]"
+		return text, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📡 RSS / Feed Subscriptions (%d total)\n\n", len(feeds)))
+
+	var rows []tg.KeyboardButtonRow
+	for _, f := range feeds {
+		status := "🟢 Active"
+		if f.Paused {
+			status = "⏸ Paused"
+		}
+
+		checkedStr := "Never"
+		if !f.LastChecked.IsZero() {
+			checkedStr = time.Since(f.LastChecked).Round(time.Second).String() + " ago"
+		}
+
+		filterStr := ""
+		if len(f.Includes) > 0 {
+			filterStr += fmt.Sprintf(" +%s", strings.Join(f.Includes, " +"))
+		}
+		if len(f.Excludes) > 0 {
+			filterStr += fmt.Sprintf(" -%s", strings.Join(f.Excludes, " -"))
+		}
+		if filterStr == "" {
+			filterStr = " None"
+		}
+
+		sb.WriteString(fmt.Sprintf("#%d %s [%s]\nStatus: %s | Checked: %s\nFilters:%s\nURL: %s\n\n",
+			f.ID, f.Name, strings.ToUpper(string(f.Mode)), status, checkedStr, filterStr, f.URL))
+
+		var btnPause tg.KeyboardButtonClass
+		if f.Paused {
+			btnPause = markup.Callback(fmt.Sprintf("▶ Resume #%d", f.ID), []byte(fmt.Sprintf("feed:resume:%d", f.ID)))
+		} else {
+			btnPause = markup.Callback(fmt.Sprintf("⏸ Pause #%d", f.ID), []byte(fmt.Sprintf("feed:pause:%d", f.ID)))
+		}
+		btnRun := markup.Callback(fmt.Sprintf("⚡ Check #%d", f.ID), []byte(fmt.Sprintf("feed:run:%d", f.ID)))
+		btnDel := markup.Callback(fmt.Sprintf("🗑 Del #%d", f.ID), []byte(fmt.Sprintf("feed:del:%d", f.ID)))
+
+		rows = append(rows, markup.Row(btnPause, btnRun, btnDel))
+	}
+
+	btnRefresh := markup.Callback("🔄 Refresh", []byte(fmt.Sprintf("feed:list:%d", userID)))
+	rows = append(rows, markup.Row(btnRefresh))
+
+	return strings.TrimSpace(sb.String()), markup.InlineKeyboard(rows...)
+}
+
+func (ts *TelegramService) notifyFeedMatch(f *FeedSubscription, item FeedItem) {
+	msg := fmt.Sprintf("📢 Feed Alert: %s\n\nTitle: %s\nLink: %s", f.Name, item.Title, item.Link)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, _ = ts.targetSender(f.Target).Text(ctx, msg)
+}
+
+func (ts *TelegramService) createFeedMirrorJob(ctx context.Context, f *FeedSubscription, title, link string) {
+	if link == "" {
+		return
+	}
+	slog.Info("creating feed mirror job", "feed_id", f.ID, "feed_name", f.Name, "link", link)
+
+	if strings.HasPrefix(link, "magnet:?") || strings.HasSuffix(strings.ToLower(link), ".torrent") {
+		if ts.torrentSvc == nil {
+			ts.sendTargetFailure(f.Target, title, "Feed Torrent", errors.New("torrent engine disabled"))
+			return
+		}
+		var magnetURI string
+		var torrentBytes []byte
+		if strings.HasPrefix(link, "magnet:?") {
+			magnetURI = link
+		} else {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+			if err == nil {
+				req.Header.Set("User-Agent", "Mozilla/5.0")
+				resp, err := http.DefaultClient.Do(req)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					torrentBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+					resp.Body.Close()
+				}
+			}
+		}
+
+		var jobRef *Job
+		execFn := func() {
+			ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes)
+		}
+		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, title, 0, f.UserID, execFn)
+		if err != nil {
+			ts.sendTargetFailure(f.Target, title, "Feed Mirror", err)
+			return
+		}
+		job.IsTorrent = true
+		job.Kind = "torrent_mirror"
+		job.Target = f.Target
+		job.MagnetURI = magnetURI
+		job.TorrentBytes = torrentBytes
+		ts.jm.SaveState()
+		jobRef = job
+		go ts.startLiveStatusUpdater(f.Target)
+		return
+	}
+
+	var jobRef *Job
+	execFn := func() {
+		ts.executeURLMirrorJob(jobRef, link)
+	}
+	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, title, 0, f.UserID, execFn)
+	if err != nil {
+		ts.sendTargetFailure(f.Target, title, "Feed Mirror", err)
+		return
+	}
+	job.Kind = "url_mirror"
+	job.Target = f.Target
+	job.RawURL = link
+	ts.jm.SaveState()
+	jobRef = job
+	go ts.startLiveStatusUpdater(f.Target)
+}
+
+func (ts *TelegramService) createFeedLeechJob(ctx context.Context, f *FeedSubscription, title, link string) {
+	if link == "" {
+		return
+	}
+	slog.Info("creating feed leech job", "feed_id", f.ID, "feed_name", f.Name, "link", link)
+
+	if strings.HasPrefix(link, "magnet:?") || strings.HasSuffix(strings.ToLower(link), ".torrent") {
+		if ts.torrentSvc == nil {
+			ts.sendTargetFailure(f.Target, title, "Feed Torrent", errors.New("torrent engine disabled"))
+			return
+		}
+		var magnetURI string
+		var torrentBytes []byte
+		if strings.HasPrefix(link, "magnet:?") {
+			magnetURI = link
+		} else {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+			if err == nil {
+				req.Header.Set("User-Agent", "Mozilla/5.0")
+				resp, err := http.DefaultClient.Do(req)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					torrentBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+					resp.Body.Close()
+				}
+			}
+		}
+
+		var jobRef *Job
+		execFn := func() {
+			ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes)
+		}
+		job, err := ts.jm.CreateJob(ctx, JobTypeLeech, title, 0, f.UserID, execFn)
+		if err != nil {
+			ts.sendTargetFailure(f.Target, title, "Feed Leech", err)
+			return
+		}
+		job.IsTorrent = true
+		job.Kind = "torrent_leech"
+		job.Target = f.Target
+		job.MagnetURI = magnetURI
+		job.TorrentBytes = torrentBytes
+		ts.jm.SaveState()
+		jobRef = job
+		go ts.startLiveStatusUpdater(f.Target)
+		return
+	}
+
+	var jobRef *Job
+	execFn := func() {
+		ts.executeLeechJob(jobRef, link)
+	}
+	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, title, 0, f.UserID, execFn)
+	if err != nil {
+		ts.sendTargetFailure(f.Target, title, "Feed Leech", err)
+		return
+	}
+	job.Kind = "url_leech"
+	job.Target = f.Target
+	job.RawURL = link
+	ts.jm.SaveState()
+	jobRef = job
+	go ts.startLiveStatusUpdater(f.Target)
+}
+

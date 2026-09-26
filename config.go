@@ -61,6 +61,8 @@ type Config struct {
 	TorrentDownloadDir     string    `json:"torrent_download_dir"`  // temp dir for torrent pieces (default "torrent_downloads")
 	TorrentListenPort      int       `json:"torrent_listen_port"`   // DHT listen port (default 0 = random)
 	JobStateFile           string    `json:"job_state_file"`        // persistence file for restart resume (default "jobs_state.json")
+	FeedStateFile          string    `json:"feed_state_file"`       // persistence file for RSS/Atom feeds (default "feeds_state.json")
+	FeedCheckIntervalSec   int       `json:"feed_check_interval_sec"` // RSS check interval in seconds (default 600)
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -135,6 +137,12 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.JobStateFile == "" {
 		cfg.JobStateFile = "jobs_state.json"
+	}
+	if cfg.FeedStateFile == "" {
+		cfg.FeedStateFile = "feeds_state.json"
+	}
+	if cfg.FeedCheckIntervalSec <= 0 {
+		cfg.FeedCheckIntervalSec = 600
 	}
 
 	// Merge all allowed chat ID variations

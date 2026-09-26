@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/td/telegram"
@@ -85,6 +86,7 @@ func main() {
 		errCh <- client.Run(ctx, func(ctx context.Context) error {
 			slog.Info("Zenith-Mirror bot engine running and listening for commands")
 			go ts.RecoverJobs(ctx)
+			go ts.StartFeedWorker(ctx, time.Duration(cfg.FeedCheckIntervalSec)*time.Second)
 			<-ctx.Done()
 			return nil
 		})

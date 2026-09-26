@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -54,9 +55,11 @@ type TelegramService struct {
 		closer  io.Closer
 	}
 	feedMgr     *FeedManager
-	dmMgr       *DMUserManager
-	cfgPath     string
-	botUsername string
+	dmMgr            *DMUserManager
+	cfgPath          string
+	botUsername      string
+	groupMemberCache sync.Map
+	httpClient       *http.Client
 }
 
 func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
@@ -73,6 +76,9 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 			invoker tg.Invoker
 			closer  io.Closer
 		}),
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}
 	ts.feedMgr = NewFeedManager(cfg.FeedStateFile, ts)
 	ts.downloader = NewLeechPipeline(ts)
@@ -134,7 +140,8 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	}
 
 	userID := ts.getUserID(msg)
-	authorized, isDM := ts.checkAuthorization(msg)
+	isOwner := ts.cfg.IsOwner(userID)
+	authorized, isDM := ts.checkAuthorization(ctx, msg)
 	if !authorized {
 		if isDM {
 			slog.Warn("unauthorized DM access attempt", "user_id", userID, "text", text)
@@ -175,8 +182,8 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 		return err
 	}
 
-	// DM command restrictions: Tasks cannot be run or cancelled in DMs
-	if !isGroup {
+	// DM command restrictions: Non-owners cannot run or cancel tasks in DMs
+	if !isGroup && !isOwner {
 		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" ||
 			strings.HasPrefix(text, "/leech") ||
 			strings.HasPrefix(text, "/cancel") ||
@@ -301,22 +308,33 @@ func (ts *TelegramService) getUserID(msg *tg.Message) int64 {
 	return 0
 }
 
-func (ts *TelegramService) checkAuthorization(msg *tg.Message) (bool, bool) {
+func (ts *TelegramService) checkAuthorization(ctx context.Context, msg *tg.Message) (bool, bool) {
 	userID := ts.getUserID(msg)
 	isOwner := ts.cfg.IsOwner(userID)
 
 	switch p := msg.PeerID.(type) {
 	case *tg.PeerUser:
-		// Direct Message: user ID must match owner or be in allowed_chat_id
-		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.UserID) || (userID != 0 && ts.cfg.IsChatAllowed(userID))
-		return isAllowed, true
+		// Direct Message: user ID must match owner, be in allowed_chat_id, or be an active member of allowed groups
+		if isOwner || ts.cfg.IsChatAllowed(p.UserID) || (userID != 0 && ts.cfg.IsChatAllowed(userID)) {
+			return true, true
+		}
+		if userID != 0 && ts.isMemberOfAllowedGroups(ctx, userID) {
+			return true, true
+		}
+		return false, true
 	case *tg.PeerChat:
 		// Group Chat: reply to anyone if group chat ID is allowed (or sender is owner)
 		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.ChatID)
+		if isAllowed && userID != 0 {
+			ts.cacheGroupMember(userID)
+		}
 		return isAllowed, false
 	case *tg.PeerChannel:
 		// Supergroup or channel: reply to anyone if channel ID is allowed (or sender is owner)
 		isAllowed := isOwner || ts.cfg.IsChatAllowed(p.ChannelID)
+		if isAllowed && userID != 0 {
+			ts.cacheGroupMember(userID)
+		}
 		return isAllowed, false
 	default:
 		return isOwner, false
@@ -1129,6 +1147,103 @@ func (ts *TelegramService) RegisterBotCommands(ctx context.Context) error {
 	return nil
 }
 
+type memberCacheEntry struct {
+	isMember  bool
+	checkedAt time.Time
+}
+
+func (ts *TelegramService) cacheGroupMember(userID int64) {
+	if userID == 0 {
+		return
+	}
+	ts.groupMemberCache.Store(userID, memberCacheEntry{
+		isMember:  true,
+		checkedAt: time.Now(),
+	})
+}
+
+func (ts *TelegramService) isMemberOfAllowedGroups(ctx context.Context, userID int64) bool {
+	if userID == 0 {
+		return false
+	}
+	if ts.cfg.IsOwner(userID) {
+		return true
+	}
+	if ts.cfg.IsChatAllowed(userID) {
+		return true
+	}
+
+	// 1. Check in-memory cache
+	if val, ok := ts.groupMemberCache.Load(userID); ok {
+		entry := val.(memberCacheEntry)
+		ttl := 2 * time.Hour
+		if !entry.isMember {
+			ttl = 30 * time.Second
+		}
+		if time.Since(entry.checkedAt) < ttl {
+			return entry.isMember
+		}
+	}
+
+	botToken := ts.cfg.BotToken
+	if botToken == "" {
+		return false
+	}
+
+	allowedChats := ts.cfg.GetAllowedChatIDs()
+	hasGroup := false
+	for _, chatID := range allowedChats {
+		chatStr := strconv.FormatInt(chatID, 10)
+		if !strings.HasPrefix(chatStr, "-") {
+			chatStr = "-100" + chatStr
+		}
+		hasGroup = true
+
+		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getChatMember?chat_id=%s&user_id=%d",
+			botToken, chatStr, userID)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			continue
+		}
+
+		resp, err := ts.httpClient.Do(req)
+		if err != nil {
+			slog.Warn("failed getChatMember request", "chat_id", chatStr, "user_id", userID, "error", err)
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var res struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					Status string `json:"status"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(body, &res); err == nil && res.OK {
+				switch res.Result.Status {
+				case "creator", "administrator", "member", "restricted":
+					ts.cacheGroupMember(userID)
+					return true
+				}
+			}
+		}
+	}
+
+	if !hasGroup {
+		return false
+	}
+
+	ts.groupMemberCache.Store(userID, memberCacheEntry{
+		isMember:  false,
+		checkedAt: time.Now(),
+	})
+	return false
+}
+
 func (ts *TelegramService) inputPeerFromTarget(target JobTarget) tg.InputPeerClass {
 	switch target.PeerType {
 	case "user":
@@ -1321,6 +1436,8 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
 		if isGroupPeer(msg.PeerID) {
 			_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Mirror queued: %s", fileName))
+		} else {
+			_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("📥 Mirror queued: %s", fileName))
 		}
 		go ts.startLiveStatusUpdater(target)
 		return nil
@@ -1469,6 +1586,8 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Queued %d media file(s) for mirroring.", queuedJobs))
+	} else {
+		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("📥 Queued %d media file(s) for mirroring.", queuedJobs))
 	}
 	go ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
 
@@ -1936,6 +2055,8 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Leech queued: %s", fileName))
+	} else {
+		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("📥 Leech queued: %s", fileName))
 	}
 	go ts.startLiveStatusUpdater(target)
 	return nil

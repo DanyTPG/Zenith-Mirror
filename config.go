@@ -253,6 +253,14 @@ func (c *Config) IsAllowed(id int64) bool {
 	return c.IsOwner(id) || c.IsChatAllowed(id)
 }
 
+func (c *Config) GetAllowedChatIDs() []int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	res := make([]int64, len(c.AllowedChatID))
+	copy(res, c.AllowedChatID)
+	return res
+}
+
 func matchChatID(configured int64, peerID int64) bool {
 	if configured == peerID {
 		return true

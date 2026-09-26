@@ -70,6 +70,8 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 	slog.Info("torrent mirror job created", "job_id", job.ID, "name", displayName)
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))
+	} else {
+		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("📥 Torrent queued: %s", displayName))
 	}
 	go ts.startLiveStatusUpdater(target)
 	return nil
@@ -123,6 +125,8 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	slog.Info("torrent leech job created", "job_id", job.ID, "name", displayName)
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))
+	} else {
+		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("📥 Torrent queued: %s", displayName))
 	}
 	go ts.startLiveStatusUpdater(target)
 	return nil

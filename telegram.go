@@ -1829,7 +1829,6 @@ func (ts *TelegramService) handleFeedCallback(ctx context.Context, entities tg.E
 		}
 	case "run":
 		if len(parts) >= 3 {
-			id, _ := strconv.Atoi(parts[2])
 			feed := ts.feedMgr.GetFeed(parts[2], u.UserID, isOwner)
 			if feed == nil {
 				toast = "Feed not found"
@@ -1857,11 +1856,11 @@ func (ts *TelegramService) handleFeedCallback(ctx context.Context, entities tg.E
 	channelID, accessHash := extractPeerChannelInfo(u.Peer, entities)
 	peer := ts.buildInputPeer(u.Peer, channelID, accessHash)
 	text, feedMarkup := ts.buildFeedListMessage(u.UserID, isOwner)
-	builder := ts.sender.To(peer).Edit(u.MsgID)
+	b := ts.sender.To(peer)
 	if feedMarkup != nil {
-		builder = builder.Markup(feedMarkup)
+		b = b.Markup(feedMarkup)
 	}
-	_, _ = builder.Text(ctx, text)
+	_, _ = b.Edit(u.MsgID).Text(ctx, text)
 	return nil
 }
 

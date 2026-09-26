@@ -40,5 +40,16 @@ func TestDMUserManager(t *testing.T) {
 		t.Fatalf("unexpected persisted user details: %+v", u2)
 	}
 
+	// Test unregister
+	mgr2.Unregister(12345)
+	if mgr2.HasUser(12345) {
+		t.Fatal("expected user to be removed after unregister")
+	}
+
+	mgr3 := NewDMUserManager(storePath)
+	if mgr3.HasUser(12345) {
+		t.Fatal("expected user to remain removed in reloaded instance")
+	}
+
 	_ = os.Remove(storePath)
 }

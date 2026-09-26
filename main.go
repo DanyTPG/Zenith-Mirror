@@ -86,6 +86,11 @@ func main() {
 	go func() {
 		errCh <- client.Run(ctx, func(ctx context.Context) error {
 			slog.Info("Zenith-Mirror bot engine running and listening for commands")
+			go func() {
+				if err := ts.RegisterBotCommands(ctx); err != nil {
+					slog.Warn("could not register bot commands menu", "error", err)
+				}
+			}()
 			go ts.RecoverJobs(ctx)
 			go ts.StartFeedWorker(ctx, time.Duration(cfg.FeedCheckIntervalSec)*time.Second)
 			<-ctx.Done()

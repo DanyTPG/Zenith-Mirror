@@ -104,6 +104,19 @@ func (m *DMUserManager) Register(userID, accessHash int64, username, firstName s
 	_ = m.SaveLocked()
 }
 
+func (m *DMUserManager) Unregister(userID int64) {
+	if userID == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.users[userID]; ok {
+		delete(m.users, userID)
+		_ = m.SaveLocked()
+	}
+}
+
 func (m *DMUserManager) HasUser(userID int64) bool {
 	if userID == 0 {
 		return false

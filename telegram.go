@@ -107,6 +107,24 @@ func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
 	dispatcher.OnBotCallbackQuery(func(ctx context.Context, entities tg.Entities, update *tg.UpdateBotCallbackQuery) error {
 		return ts.handleBotCallbackQuery(ctx, entities, update)
 	})
+
+	dispatcher.OnBotStopped(func(ctx context.Context, entities tg.Entities, update *tg.UpdateBotStopped) error {
+		if update.Stopped {
+			slog.Info("user stopped/blocked bot in DM", "user_id", update.UserID)
+			ts.dmMgr.Unregister(update.UserID)
+		} else {
+			slog.Info("user unblocked/started bot in DM", "user_id", update.UserID)
+			var accessHash int64
+			var username, firstName string
+			if user, ok := entities.Users[update.UserID]; ok {
+				accessHash = user.AccessHash
+				username = user.Username
+				firstName = user.FirstName
+			}
+			ts.dmMgr.Register(update.UserID, accessHash, username, firstName)
+		}
+		return nil
+	})
 }
 
 func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message) error {
@@ -168,18 +186,20 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 		}
 	}
 
-	// Group command checks: user must have started the bot in DMs
+	// Group command checks: user must have started the bot in DMs and be reachable
 	if isGroup {
 		isTaskCmd := strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" ||
 			strings.HasPrefix(text, "/leech") ||
 			strings.HasPrefix(text, "/cancel")
 
-		if isTaskCmd && !ts.dmMgr.HasUser(userID) {
-			startLink := ts.getBotStartLink(ctx)
-			mention := ts.formatUserMention(msg, entities, userID)
-			errMsg := fmt.Sprintf("⚠️ %s, please start the bot in private chat (DM) first so I can send your task reports:\n👉 %s", mention, startLink)
-			_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
-			return err
+		if isTaskCmd {
+			if !ts.verifyDMReachability(ctx, userID) {
+				startLink := ts.getBotStartLink(ctx)
+				mention := ts.formatUserMention(msg, entities, userID)
+				errMsg := fmt.Sprintf("⚠️ %s, please start/unblock the bot in private chat (DM) first so I can send your task reports:\n👉 %s", mention, startLink)
+				_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
+				return err
+			}
 		}
 	}
 
@@ -1038,6 +1058,10 @@ func (ts *TelegramService) sendDMText(ctx context.Context, userID int64, text st
 		return fmt.Errorf("user %d has not started bot in DM", userID)
 	}
 	_, err := ts.sender.To(peer).Text(ctx, text)
+	if err != nil {
+		slog.Warn("failed sending DM text, unregistering user", "user_id", userID, "error", err)
+		ts.dmMgr.Unregister(userID)
+	}
 	return err
 }
 
@@ -1047,7 +1071,62 @@ func (ts *TelegramService) sendDMStyled(ctx context.Context, userID int64, opts 
 		return fmt.Errorf("user %d has not started bot in DM", userID)
 	}
 	_, err := ts.sender.To(peer).StyledText(ctx, opts...)
+	if err != nil {
+		slog.Warn("failed sending DM styled text, unregistering user", "user_id", userID, "error", err)
+		ts.dmMgr.Unregister(userID)
+	}
 	return err
+}
+
+func (ts *TelegramService) verifyDMReachability(ctx context.Context, userID int64) bool {
+	peer, ok := ts.dmMgr.InputPeer(userID)
+	if !ok {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	_, err := ts.client.API().MessagesSetTyping(probeCtx, &tg.MessagesSetTypingRequest{
+		Peer:   peer,
+		Action: &tg.SendMessageCancelAction{},
+	})
+	if err != nil {
+		slog.Warn("silent DM probe failed, unregistering user", "user_id", userID, "error", err)
+		ts.dmMgr.Unregister(userID)
+		return false
+	}
+	return true
+}
+
+func (ts *TelegramService) RegisterBotCommands(ctx context.Context) error {
+	commands := []tg.BotCommand{
+		{Command: "mirror", Description: "Mirror HTTP/magnet/.torrent to Google Drive"},
+		{Command: "leech", Description: "Leech HTTP/magnet/.torrent to Telegram"},
+		{Command: "feed", Description: "Manage RSS/Atom release feeds"},
+		{Command: "status", Description: "View active transfer jobs"},
+		{Command: "cancel", Description: "Cancel your active job"},
+		{Command: "cancelall", Description: "Cancel all transfer jobs (Owner)"},
+		{Command: "stats", Description: "View system and host performance (Owner)"},
+		{Command: "restart", Description: "Restart bot service with state persistence (Owner)"},
+		{Command: "reload", Description: "Reload configuration dynamically (Owner)"},
+		{Command: "cleancache", Description: "Purge scratch space and free memory (Owner)"},
+		{Command: "help", Description: "Show available commands"},
+	}
+
+	req := &tg.BotsSetBotCommandsRequest{
+		Scope:    &tg.BotCommandScopeDefault{},
+		LangCode: "",
+		Commands: commands,
+	}
+
+	_, err := ts.client.API().BotsSetBotCommands(ctx, req)
+	if err != nil {
+		slog.Warn("failed setting bot commands menu", "error", err)
+		return err
+	}
+	slog.Info("bot commands menu registered with Telegram", "count", len(commands))
+	return nil
 }
 
 func (ts *TelegramService) inputPeerFromTarget(target JobTarget) tg.InputPeerClass {

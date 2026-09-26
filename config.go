@@ -65,6 +65,7 @@ type Config struct {
 	JobStateFile           string    `json:"job_state_file"`        // persistence file for restart resume (default "jobs_state.json")
 	FeedStateFile          string    `json:"feed_state_file"`       // persistence file for RSS/Atom feeds (default "feeds_state.json")
 	FeedCheckIntervalSec   int       `json:"feed_check_interval_sec"` // RSS check interval in seconds (default 600)
+	DMUsersFile            string    `json:"dm_users_file"`         // persistence file for users who started DM (default "dm_users.json")
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -145,6 +146,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.FeedCheckIntervalSec <= 0 {
 		cfg.FeedCheckIntervalSec = 600
+	}
+	if cfg.DMUsersFile == "" {
+		cfg.DMUsersFile = "dm_users.json"
 	}
 
 	// Merge all allowed chat ID variations

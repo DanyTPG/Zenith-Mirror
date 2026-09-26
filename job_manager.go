@@ -34,12 +34,14 @@ const (
 )
 
 type JobTarget struct {
-	PeerType   string `json:"peer_type"` // "user", "chat", "channel"
-	UserID     int64  `json:"user_id,omitempty"`
-	ChatID     int64  `json:"chat_id,omitempty"`
-	ChannelID  int64  `json:"channel_id,omitempty"`
-	AccessHash int64  `json:"access_hash,omitempty"`
-	ReplyMsgID int    `json:"reply_msg_id"`
+	PeerType     string `json:"peer_type"` // "user", "chat", "channel"
+	UserID       int64  `json:"user_id,omitempty"`
+	ChatID       int64  `json:"chat_id,omitempty"`
+	ChannelID    int64  `json:"channel_id,omitempty"`
+	AccessHash   int64  `json:"access_hash,omitempty"`
+	ReplyMsgID   int    `json:"reply_msg_id"`
+	DMPeerUser   int64  `json:"dm_peer_user,omitempty"`
+	DMAccessHash int64  `json:"dm_access_hash,omitempty"`
 }
 
 type StoredLocation struct {

@@ -21,5 +21,6 @@
   "status_refresh_delay_sec": 10,
   "job_state_file": "jobs_state.json",
   "feed_state_file": "feeds_state.json",
-  "feed_check_interval_sec": 600
+  "feed_check_interval_sec": 600,
+  "dm_users_file": "dm_users.json"
 }

@@ -53,7 +53,11 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, displayName, 0, userID, execFn)
 	if err != nil {
 		slog.Error("failed creating torrent mirror job", "error", err)
-		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		if isGroupPeer(msg.PeerID) {
+			_ = ts.sendDMText(ctx, userID, fmt.Sprintf("Error creating job: %v", err))
+		} else {
+			_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		}
 		return err
 	}
 	job.IsTorrent = true
@@ -64,6 +68,9 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 	ts.jm.SaveState()
 	jobRef = job
 	slog.Info("torrent mirror job created", "job_id", job.ID, "name", displayName)
+	if isGroupPeer(msg.PeerID) {
+		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))
+	}
 	go ts.startLiveStatusUpdater(target)
 	return nil
 }
@@ -99,7 +106,11 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, displayName, 0, userID, execFn)
 	if err != nil {
 		slog.Error("failed creating torrent leech job", "error", err)
-		_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		if isGroupPeer(msg.PeerID) {
+			_ = ts.sendDMText(ctx, userID, fmt.Sprintf("Error creating job: %v", err))
+		} else {
+			_, _ = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
+		}
 		return err
 	}
 	job.IsTorrent = true
@@ -110,6 +121,9 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 	ts.jm.SaveState()
 	jobRef = job
 	slog.Info("torrent leech job created", "job_id", job.ID, "name", displayName)
+	if isGroupPeer(msg.PeerID) {
+		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))
+	}
 	go ts.startLiveStatusUpdater(target)
 	return nil
 }
@@ -494,7 +508,7 @@ doneLeech:
 		fileSize := info.Size()
 		if fileSize > 2*1024*1024*1024 {
 			slog.Warn("file exceeds Telegram bot limit, skipping", "job_id", job.ID, "file", f.DisplayPath(), "size", fileSize)
-			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(fileSize)))
+			_, _ = ts.reportSender(job.Target).Text(context.Background(), fmt.Sprintf("Skipping %s (%s) — exceeds 2GB Telegram limit.", f.DisplayPath(), FormatBytes(fileSize)))
 			continue
 		}
 		fileName := filepath.Base(diskPath)
@@ -524,16 +538,16 @@ doneLeech:
 		_ = fh.Close()
 		if uploadErr != nil {
 			slog.Error("telegram upload failed for torrent file", "job_id", job.ID, "file", fileName, "error", uploadErr)
-			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
+			_, _ = ts.reportSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed uploading %s: %v", fileName, uploadErr))
 			continue
 		}
 
 		// Send uploaded file to the Telegram chat
 		mediaOpt := buildMediaOption(inputFile, fileName)
-		_, sendErr := ts.targetSender(job.Target).Media(context.Background(), mediaOpt)
+		_, sendErr := ts.reportSender(job.Target).Media(context.Background(), mediaOpt)
 		if sendErr != nil {
 			slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
-			_, _ = ts.targetSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))
+			_, _ = ts.reportSender(job.Target).Text(context.Background(), fmt.Sprintf("Failed delivering %s to chat: %v", fileName, sendErr))
 			continue
 		}
 

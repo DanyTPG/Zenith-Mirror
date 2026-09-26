@@ -53,8 +53,10 @@ type TelegramService struct {
 		invoker tg.Invoker
 		closer  io.Closer
 	}
-	feedMgr *FeedManager
-	cfgPath string
+	feedMgr     *FeedManager
+	dmMgr       *DMUserManager
+	cfgPath     string
+	botUsername string
 }
 
 func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
@@ -65,6 +67,7 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 		jm:        jm,
 		dm:        NewDownloadManager(int64(cfg.MaxConcurrentDownloads)),
 		cfg:       cfg,
+		dmMgr:     NewDMUserManager(cfg.DMUsersFile),
 		startTime: time.Now(),
 		poolCache: make(map[int]struct {
 			invoker tg.Invoker
@@ -124,20 +127,71 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 		return nil
 	}
 
+	isGroup := isGroupPeer(msg.PeerID)
+
+	// If in DM, automatically register/update the user in DM manager
+	if !isGroup {
+		var accessHash int64
+		var username, firstName string
+		if u, ok := entities.Users[userID]; ok {
+			accessHash = u.AccessHash
+			username = u.Username
+			firstName = u.FirstName
+		}
+		ts.dmMgr.Register(userID, accessHash, username, firstName)
+	}
+
 	if strings.HasPrefix(text, "/start") {
+		if !isGroup {
+			welcome := "👋 Welcome to Zenith-Mirror!\n\n" +
+				"You have successfully activated the bot in DMs.\n" +
+				"You can now run mirror and leech tasks inside your authorized group. " +
+				"All task completion reports, download links, and leeched files will be delivered here.\n\n" +
+				"Commands available in DMs:\n" +
+				"• /feed - Manage your RSS/Atom release feeds\n" +
+				"• /feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]"
+			_, err := ts.sender.Reply(entities, update).Text(ctx, welcome)
+			return err
+		}
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Welcome to Zenith Mirror! Send /help for commands.")
 		return err
 	}
 
+	// DM command restrictions: Tasks cannot be run or cancelled in DMs
+	if !isGroup {
+		if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" ||
+			strings.HasPrefix(text, "/leech") ||
+			strings.HasPrefix(text, "/cancel") ||
+			strings.HasPrefix(text, "/status") {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ This command can only be used inside the group.\n\nDMs are only for receiving task reports and managing RSS feeds (/feed).")
+			return err
+		}
+	}
+
+	// Group command checks: user must have started the bot in DMs
+	if isGroup {
+		isTaskCmd := strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" ||
+			strings.HasPrefix(text, "/leech") ||
+			strings.HasPrefix(text, "/cancel")
+
+		if isTaskCmd && !ts.dmMgr.HasUser(userID) {
+			startLink := ts.getBotStartLink(ctx)
+			mention := ts.formatUserMention(msg, entities, userID)
+			errMsg := fmt.Sprintf("⚠️ %s, please start the bot in private chat (DM) first so I can send your task reports:\n👉 %s", mention, startLink)
+			_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
+			return err
+		}
+	}
+
 	if strings.HasPrefix(text, "/help") {
 		helpText := "Available commands:\n" +
-			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
-			"/mirror magnet:?xt=... OR reply to .torrent with /mirror - Torrent to Drive\n" +
-			"/leech <url> OR magnet:?xt=... - Leech to Telegram\n" +
-			"/feed - Manage your RSS/Atom release feeds\n" +
+			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive (in group)\n" +
+			"/mirror magnet:?xt=... OR reply to .torrent with /mirror - Torrent to Drive (in group)\n" +
+			"/leech <url> OR magnet:?xt=... - Leech to Telegram (in group)\n" +
+			"/feed - Manage your RSS/Atom release feeds (in DMs)\n" +
 			"/feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n" +
-			"/status - View active transfer jobs\n" +
-			"/cancel <id> - Cancel your active job\n" +
+			"/status - View active transfer jobs (in group)\n" +
+			"/cancel <id> - Cancel your active job (in group)\n" +
 			"/help - View this message\n\n" +
 			"Owner commands:\n" +
 			"/stats - View system and host performance\n" +
@@ -146,12 +200,24 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 			"/restart - Restart bot service with state persistence\n" +
 			"/reload - Reload configuration without interruption\n" +
 			"/cleancache - Reclaim temp space, torrent scratch, and memory"
+		if isGroup {
+			if ts.dmMgr.HasUser(userID) {
+				_ = ts.sendDMText(ctx, userID, helpText)
+			} else {
+				startLink := ts.getBotStartLink(ctx)
+				mention := ts.formatUserMention(msg, entities, userID)
+				errMsg := fmt.Sprintf("⚠️ %s, please start the bot in private chat (DM) first to receive help:\n👉 %s", mention, startLink)
+				_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
+				return err
+			}
+			return nil
+		}
 		_, err := ts.sender.Reply(entities, update).Text(ctx, helpText)
 		return err
 	}
 
 	if strings.HasPrefix(text, "/stats") {
-		return ts.handleStats(ctx, entities, update, userID)
+		return ts.handleStats(ctx, entities, update, msg, userID)
 	}
 
 	if strings.HasPrefix(text, "/log") {
@@ -171,15 +237,15 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	}
 
 	if strings.HasPrefix(text, "/restart") {
-		return ts.handleRestart(ctx, entities, update, userID)
+		return ts.handleRestart(ctx, entities, update, msg, userID)
 	}
 
 	if strings.HasPrefix(text, "/reload") {
-		return ts.handleReload(ctx, entities, update, userID)
+		return ts.handleReload(ctx, entities, update, msg, userID)
 	}
 
 	if strings.HasPrefix(text, "/cleancache") {
-		return ts.handleCleanCache(ctx, entities, update, userID)
+		return ts.handleCleanCache(ctx, entities, update, msg, userID)
 	}
 
 	if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
@@ -191,6 +257,10 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 	}
 
 	if strings.HasPrefix(text, "/feed") {
+		if isGroup {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "ℹ️ Please manage your RSS feeds in private chat (DM).")
+			return err
+		}
 		return ts.handleFeed(ctx, entities, update, msg, text, userID)
 	}
 
@@ -238,10 +308,18 @@ func (ts *TelegramService) isAuthorized(userID int64) bool {
 }
 
 func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
+	isGroup := isGroupPeer(msg.PeerID)
+	sendReply := func(respText string) error {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, respText)
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, respText)
+		return err
+	}
+
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
-		return err
+		return sendReply("Usage: /cancel <job_id>")
 	}
 	jobID := parts[1]
 	if strings.EqualFold(jobID, "all") {
@@ -250,53 +328,51 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 
 	job := ts.jm.GetJob(jobID)
 	if job == nil {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
-		return err
+		return sendReply(fmt.Sprintf("Job %s not found or already finished.", jobID))
 	}
 	if !ts.cfg.IsOwner(userID) && job.UserID != userID {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: you can only cancel your own jobs.")
-		return err
+		return sendReply("❌ Unauthorized: you can only cancel your own jobs.")
 	}
 
 	if ts.jm.CancelJob(jobID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
+		_ = sendReply(fmt.Sprintf("Job %s cancelled.", jobID))
 		ts.deleteLastStatus()
 		if ts.jm.GetActiveJobCount() > 0 {
 			go ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
-		} else {
-			opts := ts.buildStatusStyledText()
-			updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
-			channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
-			peer := ts.buildInputPeer(msg.PeerID, channelID, accessHash)
-			ts.setLastStatus(extractMsgIDFromUpdates(updates), peer, nil)
 		}
-		return err
+		return nil
 	}
-	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
-	return err
+	return sendReply(fmt.Sprintf("Job %s not found or already finished.", jobID))
 }
 
 func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
-	if !ts.cfg.IsOwner(userID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /cancel all is limited to bot owners.")
+	isGroup := isGroupPeer(msg.PeerID)
+	sendReply := func(respText string) error {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, respText)
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, respText)
 		return err
 	}
 
+	if !ts.cfg.IsOwner(userID) {
+		return sendReply("❌ Unauthorized: /cancel all is limited to bot owners.")
+	}
+
 	cancelled := ts.jm.CancelAllJobs()
-	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled %d job(s).", cancelled))
+	_ = sendReply(fmt.Sprintf("Cancelled %d job(s).", cancelled))
 	if cancelled > 0 {
 		ts.deleteLastStatus()
-		opts := ts.buildStatusStyledText()
-		updates, _ := ts.sender.Reply(entities, update).StyledText(context.Background(), opts...)
-		channelID, accessHash := extractPeerChannelInfo(msg.PeerID, entities)
-		peer := ts.buildInputPeer(msg.PeerID, channelID, accessHash)
-		ts.setLastStatus(extractMsgIDFromUpdates(updates), peer, nil)
 	}
-	return err
+	return nil
 }
 
-func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
+func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
+	isGroup := isGroupPeer(msg.PeerID)
 	if !ts.cfg.IsOwner(userID) {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, "❌ Unauthorized: /stats is limited to bot owners.")
+		}
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /stats is limited to bot owners.")
 		return err
 	}
@@ -367,18 +443,29 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 		styling.Bold("Memory Used:"), styling.Plain(fmt.Sprintf(" %s", memUsed)),
 	}
 
+	if isGroup {
+		return ts.sendDMStyled(ctx, userID, opts...)
+	}
 	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
 	return err
 }
 
-func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
-	if !ts.cfg.IsOwner(userID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /restart is limited to bot owners.")
+func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
+	isGroup := isGroupPeer(msg.PeerID)
+	sendReply := func(respText string) error {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, respText)
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, respText)
 		return err
 	}
 
+	if !ts.cfg.IsOwner(userID) {
+		return sendReply("❌ Unauthorized: /restart is limited to bot owners.")
+	}
+
 	slog.Info("restart initiated by owner", "user_id", userID)
-	_, _ = ts.sender.Reply(entities, update).Text(ctx, "🔄 Restarting Zenith-Mirror...\nState saved. Systemd will resume active jobs.")
+	_ = sendReply("🔄 Restarting Zenith-Mirror...\nState saved. Systemd will resume active jobs.")
 
 	ts.jm.SaveState()
 	if ts.feedMgr != nil {
@@ -393,10 +480,18 @@ func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entiti
 	return nil
 }
 
-func (ts *TelegramService) handleReload(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
-	if !ts.cfg.IsOwner(userID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /reload is limited to bot owners.")
+func (ts *TelegramService) handleReload(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
+	isGroup := isGroupPeer(msg.PeerID)
+	sendReply := func(respText string) error {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, respText)
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, respText)
 		return err
+	}
+
+	if !ts.cfg.IsOwner(userID) {
+		return sendReply("❌ Unauthorized: /reload is limited to bot owners.")
 	}
 
 	cfgPath := ts.cfgPath
@@ -406,14 +501,13 @@ func (ts *TelegramService) handleReload(ctx context.Context, entities tg.Entitie
 
 	if err := ts.cfg.Reload(cfgPath); err != nil {
 		slog.Error("failed reloading config", "error", err)
-		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("❌ Reload failed: %v", err))
-		return replyErr
+		return sendReply(fmt.Sprintf("❌ Reload failed: %v", err))
 	}
 
 	ts.jm.SetMaxConcurrency(ts.cfg.MaxConcurrency)
 
 	slog.Info("configuration reloaded dynamically", "path", cfgPath)
-	msg := fmt.Sprintf("✅ Config reloaded successfully from %s\n\n"+
+	msgText := fmt.Sprintf("✅ Config reloaded successfully from %s\n\n"+
 		"• Owners: %d\n"+
 		"• Allowed Chats/Users: %d\n"+
 		"• Max Concurrency: %d\n"+
@@ -422,14 +516,21 @@ func (ts *TelegramService) handleReload(ctx context.Context, entities tg.Entitie
 		cfgPath, len(ts.cfg.OwnerID), len(ts.cfg.AllowedChatID),
 		ts.cfg.MaxConcurrency, ts.cfg.StatusRefreshDelaySec, ts.cfg.FeedCheckIntervalSec)
 
-	_, err := ts.sender.Reply(entities, update).Text(ctx, msg)
-	return err
+	return sendReply(msgText)
 }
 
-func (ts *TelegramService) handleCleanCache(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
-	if !ts.cfg.IsOwner(userID) {
-		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /cleancache is limited to bot owners.")
+func (ts *TelegramService) handleCleanCache(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
+	isGroup := isGroupPeer(msg.PeerID)
+	sendReply := func(respText string) error {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, respText)
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, respText)
 		return err
+	}
+
+	if !ts.cfg.IsOwner(userID) {
+		return sendReply("❌ Unauthorized: /cleancache is limited to bot owners.")
 	}
 
 	// 1. Clean temp download chunks (/tmp/zenith-dl-*)
@@ -492,7 +593,7 @@ func (ts *TelegramService) handleCleanCache(ctx context.Context, entities tg.Ent
 	runtime.ReadMemStats(&m)
 	heapAlloc := FormatBytes(int64(m.Alloc))
 
-	msg := fmt.Sprintf("🧹 Cache & Memory Cleanup Complete\n\n"+
+	msgText := fmt.Sprintf("🧹 Cache & Memory Cleanup Complete\n\n"+
 		"• Temp files purged: %d (%s)\n"+
 		"• Torrent scratch purged: %d unreferenced (%s)\n"+
 		"• Heap released to OS (Allocated now: %s)\n"+
@@ -501,8 +602,7 @@ func (ts *TelegramService) handleCleanCache(ctx context.Context, entities tg.Ent
 		torrentCleaned, FormatBytes(torrentBytesReclaimed),
 		heapAlloc, freeDiskStr)
 
-	_, err := ts.sender.Reply(entities, update).Text(ctx, msg)
-	return err
+	return sendReply(msgText)
 }
 
 func formatDuration(d time.Duration) string {
@@ -869,7 +969,85 @@ func (ts *TelegramService) extractJobTarget(msg *tg.Message, entities tg.Entitie
 			target.AccessHash = ch.AccessHash
 		}
 	}
+
+	if dm, ok := ts.dmMgr.GetUser(target.UserID); ok {
+		target.DMPeerUser = dm.UserID
+		target.DMAccessHash = dm.AccessHash
+	}
+
 	return target
+}
+
+func isGroupPeer(peer tg.PeerClass) bool {
+	if peer == nil {
+		return false
+	}
+	switch peer.(type) {
+	case *tg.PeerChat, *tg.PeerChannel:
+		return true
+	default:
+		return false
+	}
+}
+
+func (ts *TelegramService) getBotUsername(ctx context.Context) string {
+	if ts.botUsername != "" {
+		return ts.botUsername
+	}
+	if self, err := ts.client.Self(ctx); err == nil && self != nil {
+		ts.botUsername = self.Username
+		return self.Username
+	}
+	return ""
+}
+
+func (ts *TelegramService) getBotStartLink(ctx context.Context) string {
+	u := ts.getBotUsername(ctx)
+	if u != "" {
+		return fmt.Sprintf("https://t.me/%s?start=start", u)
+	}
+	return "the bot in private chat (DM)"
+}
+
+func (ts *TelegramService) formatUserMention(msg *tg.Message, entities tg.Entities, userID int64) string {
+	if u, ok := entities.Users[userID]; ok {
+		if u.Username != "" {
+			return "@" + u.Username
+		}
+		if u.FirstName != "" {
+			return u.FirstName
+		}
+	}
+	return fmt.Sprintf("User %d", userID)
+}
+
+func (ts *TelegramService) reportSender(target JobTarget) *message.Builder {
+	if target.DMPeerUser != 0 && target.DMAccessHash != 0 {
+		peer := &tg.InputPeerUser{
+			UserID:     target.DMPeerUser,
+			AccessHash: target.DMAccessHash,
+		}
+		return ts.sender.To(peer).CloneBuilder()
+	}
+	return ts.targetSender(target)
+}
+
+func (ts *TelegramService) sendDMText(ctx context.Context, userID int64, text string) error {
+	peer, ok := ts.dmMgr.InputPeer(userID)
+	if !ok {
+		return fmt.Errorf("user %d has not started bot in DM", userID)
+	}
+	_, err := ts.sender.To(peer).Text(ctx, text)
+	return err
+}
+
+func (ts *TelegramService) sendDMStyled(ctx context.Context, userID int64, opts ...styling.StyledTextOption) error {
+	peer, ok := ts.dmMgr.InputPeer(userID)
+	if !ok {
+		return fmt.Errorf("user %d has not started bot in DM", userID)
+	}
+	_, err := ts.sender.To(peer).StyledText(ctx, opts...)
+	return err
 }
 
 func (ts *TelegramService) inputPeerFromTarget(target JobTarget) tg.InputPeerClass {
@@ -910,7 +1088,7 @@ func (ts *TelegramService) sendTargetFailure(target JobTarget, name string, acti
 	if target.PeerType != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, sendErr := ts.targetSender(target).Text(ctx, msg)
+		_, sendErr := ts.reportSender(target).Text(ctx, msg)
 		if sendErr != nil {
 			slog.Error("failed sending failure notification to user", "error", sendErr)
 		}
@@ -1048,6 +1226,10 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, 0, userID, execFunc)
 		if err != nil {
 			slog.Error("failed creating URL mirror job", "error", err)
+			if isGroupPeer(msg.PeerID) {
+				_ = ts.sendDMText(ctx, userID, fmt.Sprintf("Error creating job: %v", err))
+				return nil
+			}
 			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 			return replyErr
 		}
@@ -1058,6 +1240,9 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		jobRef = job
 
 		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
+		if isGroupPeer(msg.PeerID) {
+			_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Mirror queued: %s", fileName))
+		}
 		go ts.startLiveStatusUpdater(target)
 		return nil
 	}
@@ -1195,10 +1380,17 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	}
 
 	if queuedJobs == 0 {
+		if isGroupPeer(msg.PeerID) {
+			_ = ts.sendDMText(ctx, userID, "No downloadable media files found in the requested range.")
+			return nil
+		}
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "No downloadable media files found in the requested range.")
 		return err
 	}
 
+	if isGroupPeer(msg.PeerID) {
+		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Queued %d media file(s) for mirroring.", queuedJobs))
+	}
 	go ts.startLiveStatusUpdater(ts.extractJobTarget(msg, entities))
 
 	return nil
@@ -1239,7 +1431,7 @@ func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, job *Job, d
 		)
 	}
 
-	builder := ts.targetSender(job.Target)
+	builder := ts.reportSender(job.Target)
 	if replyMarkup != nil {
 		builder = builder.Markup(replyMarkup)
 	}
@@ -1649,6 +1841,10 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, fileName, 0, userID, execFunc)
 	if err != nil {
 		slog.Error("failed creating leech job", "error", err)
+		if isGroupPeer(msg.PeerID) {
+			_ = ts.sendDMText(ctx, userID, fmt.Sprintf("Error creating job: %v", err))
+			return nil
+		}
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 		return replyErr
 	}
@@ -1659,6 +1855,9 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
+	if isGroupPeer(msg.PeerID) {
+		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Leech queued: %s", fileName))
+	}
 	go ts.startLiveStatusUpdater(target)
 	return nil
 }
@@ -1718,7 +1917,7 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string) {
 
 	// Send uploaded file to the Telegram chat
 	mediaOpt := buildMediaOption(inputFile, fileName)
-	_, sendErr := ts.targetSender(job.Target).Media(context.Background(), mediaOpt)
+	_, sendErr := ts.reportSender(job.Target).Media(context.Background(), mediaOpt)
 	if sendErr != nil {
 		slog.Error("failed sending uploaded file to chat", "job_id", job.ID, "file", fileName, "error", sendErr)
 		job.Status = fmt.Sprintf("Failed delivering to chat: %v", sendErr)

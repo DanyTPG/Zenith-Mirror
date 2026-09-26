@@ -93,6 +93,11 @@ See `example.config.json` for all available options.
 | `job_state_file` | Persistence file for restart resume | `jobs_state.json` |
 | `feed_state_file` | Persistence file for RSS/Atom subscriptions | `feeds_state.json` |
 | `feed_check_interval_sec` | Background scan interval for RSS feeds | `600` |
+| `dm_users_file` | Persistence file for registered DM users | `dm_users.json` |
+
+### Group vs DM Routing
+- **Group**: Exclusively hosts the single live updating status message. Task submissions (`/mirror`, `/leech`, `/cancel`) must be made in the group. If a user hasn't started the bot in DMs, the bot prompts them with a start link.
+- **Private Chat (DM)**: Receives all task completion reports, Google Drive index links, download error notices, and leeched files. Starting or cancelling tasks in DMs is disallowed. RSS feed monitoring (`/feed`) is configured and managed in DMs.
 
 ### Commands
 

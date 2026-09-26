@@ -1856,11 +1856,11 @@ func (ts *TelegramService) handleFeedCallback(ctx context.Context, entities tg.E
 	channelID, accessHash := extractPeerChannelInfo(u.Peer, entities)
 	peer := ts.buildInputPeer(u.Peer, channelID, accessHash)
 	text, feedMarkup := ts.buildFeedListMessage(u.UserID, isOwner)
-	b := ts.sender.To(peer)
+	builder := ts.sender.To(peer).CloneBuilder()
 	if feedMarkup != nil {
-		b = b.Markup(feedMarkup)
+		builder = builder.Markup(feedMarkup)
 	}
-	_, _ = b.Edit(u.MsgID).Text(ctx, text)
+	_, _ = builder.Edit(u.MsgID).Text(ctx, text)
 	return nil
 }
 

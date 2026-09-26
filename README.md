@@ -96,20 +96,30 @@ See `example.config.json` for all available options.
 
 ### Commands
 
+#### User Commands
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `/mirror` | `/mirror <url>` or reply to file / `.torrent` | Mirror to Google Drive |
 | `/leech` | `/leech <url>` or magnet | Leech to Telegram |
-| `/feed` | `/feed add [mirror\|leech\|notify] [NAME] [URL] [+include] [-exclude]` | Subscribe to RSS/Atom release feed |
-| `/feed list` | `/feed list` | View active subscriptions with interactive inline buttons |
-| `/feed pause` | `/feed pause <id\|name>` | Pause background monitoring for feed |
-| `/feed resume` | `/feed resume <id\|name>` | Resume background monitoring for feed |
-| `/feed delete` | `/feed delete <id\|name>` | Delete feed subscription |
-| `/feed check` | `/feed check [id\|name]` | Trigger immediate scan |
+| `/feed` | `/feed` | View own feed subscriptions |
+| `/feed add` | `/feed add [mirror\|leech\|notify] [NAME] [URL] [+include] [-exclude]` | Subscribe to RSS/Atom release feed |
+| `/feed pause` | `/feed pause <id\|name>` | Pause background monitoring for own feed |
+| `/feed resume` | `/feed resume <id\|name>` | Resume background monitoring for own feed |
+| `/feed delete` | `/feed delete <id\|name>` | Delete own feed subscription |
+| `/feed check` | `/feed check [id\|name]` | Trigger immediate scan on own feed |
 | `/status` | `/status` | View active transfer jobs |
-| `/cancel` | `/cancel <id>` | Cancel active job |
-| `/stats` | `/stats` | View resource and transfer statistics |
+| `/cancel` | `/cancel <id>` | Cancel own active job |
 | `/help` | `/help` | Show command usage |
+
+#### Owner-Only Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `/stats` | `/stats` | View VPS hardware and host performance metrics |
+| `/cancel all` | `/cancel all` or `/cancelall` | Cancel all running and queued jobs across all users |
+| `/feed list` | `/feed list` | View and manage all system feed subscriptions with interactive buttons |
+| `/restart` | `/restart` | Gracefully persist state and restart service via systemd |
+| `/reload` | `/reload` | Reload `config.json` dynamic settings in-memory without downtime |
+| `/cleancache` | `/cleancache` | Purge orphaned `/tmp` downloads, unreferenced torrent pieces, and free OS memory |
 
 ## Docker
 

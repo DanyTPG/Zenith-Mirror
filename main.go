@@ -78,6 +78,7 @@ func main() {
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, clientOpts)
 
 	ts := NewTelegramService(client, gdrive, jm, cfg)
+	ts.SetCfgPath(*cfgPath)
 	ts.SetTorrentService(torrentSvc)
 	ts.RegisterHandlers(dispatcher)
 

@@ -246,6 +246,12 @@ func (fm *FeedManager) LoadState() error {
 	return nil
 }
 
+func (fm *FeedManager) SaveState() {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.saveStateLocked()
+}
+
 func (fm *FeedManager) saveStateLocked() {
 	if fm.filePath == "" {
 		return

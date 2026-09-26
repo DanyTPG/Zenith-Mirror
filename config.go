@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,7 @@ func (l *Int64List) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
+	mu                     sync.RWMutex
 	AppID                  int       `json:"app_id"`
 	AppHash                string    `json:"app_hash"`
 	BotToken               string    `json:"bot_token"`
@@ -192,10 +194,35 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+func (c *Config) Reload(path string) error {
+	newCfg, err := LoadConfig(path)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.OwnerID = newCfg.OwnerID
+	c.OwnerIDs = newCfg.OwnerIDs
+	c.AllowedChatID = newCfg.AllowedChatID
+	c.AllowedChatIDs = newCfg.AllowedChatIDs
+	c.AllowedUserIDs = newCfg.AllowedUserIDs
+	c.AuthorizedUsers = newCfg.AuthorizedUsers
+	c.MaxConcurrency = newCfg.MaxConcurrency
+	c.StatusRefreshDelaySec = newCfg.StatusRefreshDelaySec
+	c.StatusRefreshDelay = newCfg.StatusRefreshDelay
+	c.FeedCheckIntervalSec = newCfg.FeedCheckIntervalSec
+
+	return nil
+}
+
 func (c *Config) IsOwner(userID int64) bool {
 	if userID == 0 {
 		return false
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for _, id := range c.OwnerID {
 		if id == userID {
 			return true
@@ -208,6 +235,8 @@ func (c *Config) IsChatAllowed(chatID int64) bool {
 	if chatID == 0 {
 		return false
 	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for _, id := range c.AllowedChatID {
 		if matchChatID(id, chatID) {
 			return true

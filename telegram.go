@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +54,7 @@ type TelegramService struct {
 		closer  io.Closer
 	}
 	feedMgr *FeedManager
+	cfgPath string
 }
 
 func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobManager, cfg *Config) *TelegramService {
@@ -75,6 +78,10 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 
 func (ts *TelegramService) SetTorrentService(svc *TorrentService) {
 	ts.torrentSvc = svc
+}
+
+func (ts *TelegramService) SetCfgPath(path string) {
+	ts.cfgPath = path
 }
 
 func (ts *TelegramService) RegisterHandlers(dispatcher tg.UpdateDispatcher) {
@@ -127,18 +134,24 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive\n" +
 			"/mirror magnet:?xt=... OR reply to .torrent with /mirror - Torrent to Drive\n" +
 			"/leech <url> OR magnet:?xt=... - Leech to Telegram\n" +
-			"/feed - Manage RSS/Atom release feeds\n" +
+			"/feed - Manage your RSS/Atom release feeds\n" +
 			"/feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n" +
 			"/status - View active transfer jobs\n" +
-			"/cancel <id> - Cancel an active job\n" +
-			"/stats - View system performance and resource usage\n" +
-			"/help - View this message"
+			"/cancel <id> - Cancel your active job\n" +
+			"/help - View this message\n\n" +
+			"Owner commands:\n" +
+			"/stats - View system and host performance\n" +
+			"/cancel all - Cancel all active transfer jobs\n" +
+			"/feed list - View all system feed subscriptions\n" +
+			"/restart - Restart bot service with state persistence\n" +
+			"/reload - Reload configuration without interruption\n" +
+			"/cleancache - Reclaim temp space, torrent scratch, and memory"
 		_, err := ts.sender.Reply(entities, update).Text(ctx, helpText)
 		return err
 	}
 
 	if strings.HasPrefix(text, "/stats") {
-		return ts.handleStats(ctx, entities, update)
+		return ts.handleStats(ctx, entities, update, userID)
 	}
 
 	if strings.HasPrefix(text, "/log") {
@@ -149,12 +162,24 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 		return ts.handleStatus(ctx, entities, update, msg)
 	}
 
-	if strings.HasPrefix(text, "/cancelall") {
-		return ts.handleCancelAll(ctx, entities, update, msg)
+	if text == "/cancel all" || strings.HasPrefix(text, "/cancel all ") || strings.HasPrefix(text, "/cancelall") {
+		return ts.handleCancelAll(ctx, entities, update, msg, userID)
 	}
 
 	if strings.HasPrefix(text, "/cancel") {
-		return ts.handleCancel(ctx, entities, update, msg, text)
+		return ts.handleCancel(ctx, entities, update, msg, text, userID)
+	}
+
+	if strings.HasPrefix(text, "/restart") {
+		return ts.handleRestart(ctx, entities, update, userID)
+	}
+
+	if strings.HasPrefix(text, "/reload") {
+		return ts.handleReload(ctx, entities, update, userID)
+	}
+
+	if strings.HasPrefix(text, "/cleancache") {
+		return ts.handleCleanCache(ctx, entities, update, userID)
 	}
 
 	if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" {
@@ -212,13 +237,27 @@ func (ts *TelegramService) isAuthorized(userID int64) bool {
 	return ts.cfg.IsAllowed(userID)
 }
 
-func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string) error {
+func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, text string, userID int64) error {
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /cancel <job_id>")
 		return err
 	}
 	jobID := parts[1]
+	if strings.EqualFold(jobID, "all") {
+		return ts.handleCancelAll(ctx, entities, update, msg, userID)
+	}
+
+	job := ts.jm.GetJob(jobID)
+	if job == nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s not found or already finished.", jobID))
+		return err
+	}
+	if !ts.cfg.IsOwner(userID) && job.UserID != userID {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: you can only cancel your own jobs.")
+		return err
+	}
+
 	if ts.jm.CancelJob(jobID) {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Job %s cancelled.", jobID))
 		ts.deleteLastStatus()
@@ -237,7 +276,12 @@ func (ts *TelegramService) handleCancel(ctx context.Context, entities tg.Entitie
 	return err
 }
 
-func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message) error {
+func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, msg *tg.Message, userID int64) error {
+	if !ts.cfg.IsOwner(userID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /cancel all is limited to bot owners.")
+		return err
+	}
+
 	cancelled := ts.jm.CancelAllJobs()
 	_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Cancelled %d job(s).", cancelled))
 	if cancelled > 0 {
@@ -251,7 +295,11 @@ func (ts *TelegramService) handleCancelAll(ctx context.Context, entities tg.Enti
 	return err
 }
 
-func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate) error {
+func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
+	if !ts.cfg.IsOwner(userID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /stats is limited to bot owners.")
+		return err
+	}
 	botUptime := formatDuration(time.Since(ts.startTime))
 
 	osUptimeStr := "N/A"
@@ -320,6 +368,140 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 	}
 
 	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	return err
+}
+
+func (ts *TelegramService) handleRestart(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
+	if !ts.cfg.IsOwner(userID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /restart is limited to bot owners.")
+		return err
+	}
+
+	slog.Info("restart initiated by owner", "user_id", userID)
+	_, _ = ts.sender.Reply(entities, update).Text(ctx, "🔄 Restarting Zenith-Mirror...\nState saved. Systemd will resume active jobs.")
+
+	ts.jm.SaveState()
+	if ts.feedMgr != nil {
+		ts.feedMgr.SaveState()
+	}
+	ts.ClosePools()
+
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		os.Exit(0)
+	}()
+	return nil
+}
+
+func (ts *TelegramService) handleReload(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
+	if !ts.cfg.IsOwner(userID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /reload is limited to bot owners.")
+		return err
+	}
+
+	cfgPath := ts.cfgPath
+	if cfgPath == "" {
+		cfgPath = "config.json"
+	}
+
+	if err := ts.cfg.Reload(cfgPath); err != nil {
+		slog.Error("failed reloading config", "error", err)
+		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("❌ Reload failed: %v", err))
+		return replyErr
+	}
+
+	ts.jm.SetMaxConcurrency(ts.cfg.MaxConcurrency)
+
+	slog.Info("configuration reloaded dynamically", "path", cfgPath)
+	msg := fmt.Sprintf("✅ Config reloaded successfully from %s\n\n"+
+		"• Owners: %d\n"+
+		"• Allowed Chats/Users: %d\n"+
+		"• Max Concurrency: %d\n"+
+		"• Status Refresh: %ds\n"+
+		"• Feed Interval: %ds",
+		cfgPath, len(ts.cfg.OwnerID), len(ts.cfg.AllowedChatID),
+		ts.cfg.MaxConcurrency, ts.cfg.StatusRefreshDelaySec, ts.cfg.FeedCheckIntervalSec)
+
+	_, err := ts.sender.Reply(entities, update).Text(ctx, msg)
+	return err
+}
+
+func (ts *TelegramService) handleCleanCache(ctx context.Context, entities tg.Entities, update message.AnswerableMessageUpdate, userID int64) error {
+	if !ts.cfg.IsOwner(userID) {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /cleancache is limited to bot owners.")
+		return err
+	}
+
+	// 1. Clean temp download chunks (/tmp/zenith-dl-*)
+	tempMatches, _ := filepath.Glob(filepath.Join(os.TempDir(), "zenith-dl-*"))
+	tempRemoved := 0
+	var tempBytesReclaimed int64
+	for _, m := range tempMatches {
+		if fi, err := os.Stat(m); err == nil {
+			tempBytesReclaimed += fi.Size()
+		}
+		if os.Remove(m) == nil {
+			tempRemoved++
+		}
+	}
+
+	// 2. Clean orphaned torrent pieces
+	torrentCleaned := 0
+	var torrentBytesReclaimed int64
+	if ts.cfg.TorrentDownloadDir != "" {
+		activeJobs := ts.jm.GetActiveJobs()
+		activeNames := make(map[string]bool)
+		for _, j := range activeJobs {
+			if j.IsTorrent && j.FileName != "" {
+				activeNames[j.FileName] = true
+			}
+		}
+
+		entries, err := os.ReadDir(ts.cfg.TorrentDownloadDir)
+		if err == nil {
+			for _, entry := range entries {
+				if !activeNames[entry.Name()] {
+					path := filepath.Join(ts.cfg.TorrentDownloadDir, entry.Name())
+					var size int64
+					_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+						if err == nil && info != nil && !info.IsDir() {
+							size += info.Size()
+						}
+						return nil
+					})
+					if os.RemoveAll(path) == nil {
+						torrentCleaned++
+						torrentBytesReclaimed += size
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Force garbage collection and OS memory release
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	// 4. Query current system stats
+	freeDiskStr := "N/A"
+	if usage, err := disk.Usage("/"); err == nil {
+		freeDiskStr = FormatBytes(int64(usage.Free))
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	heapAlloc := FormatBytes(int64(m.Alloc))
+
+	msg := fmt.Sprintf("🧹 Cache & Memory Cleanup Complete\n\n"+
+		"• Temp files purged: %d (%s)\n"+
+		"• Torrent scratch purged: %d unreferenced (%s)\n"+
+		"• Heap released to OS (Allocated now: %s)\n"+
+		"• Disk free on /: %s",
+		tempRemoved, FormatBytes(tempBytesReclaimed),
+		torrentCleaned, FormatBytes(torrentBytesReclaimed),
+		heapAlloc, freeDiskStr)
+
+	_, err := ts.sender.Reply(entities, update).Text(ctx, msg)
 	return err
 }
 
@@ -1901,7 +2083,11 @@ func (ts *TelegramService) handleFeed(ctx context.Context, entities tg.Entities,
 	sub := strings.ToLower(args[1])
 	switch sub {
 	case "list":
-		msgText, feedMarkup := ts.buildFeedListMessage(userID, isOwner)
+		if !isOwner {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ Unauthorized: /feed list is limited to bot owners.")
+			return err
+		}
+		msgText, feedMarkup := ts.buildFeedListMessage(userID, true)
 		builder := ts.sender.Reply(entities, update)
 		if feedMarkup != nil {
 			builder = builder.Markup(feedMarkup)

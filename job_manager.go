@@ -371,6 +371,30 @@ func (jm *JobManager) CancelJob(id string) bool {
 	return true
 }
 
+func (jm *JobManager) GetJob(id string) *Job {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	if j, ok := jm.active[id]; ok {
+		return j
+	}
+	for _, qJob := range jm.queue {
+		if qJob.ID == id {
+			return qJob
+		}
+	}
+	return nil
+}
+
+func (jm *JobManager) SetMaxConcurrency(n int) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+
+	if n > 0 {
+		jm.maxConcurrency = n
+	}
+}
+
 func (jm *JobManager) CancelAllJobs() int {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()

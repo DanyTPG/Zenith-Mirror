@@ -193,6 +193,7 @@ func matchesFilters(title string, includes []string, excludes []string) bool {
 type FeedManager struct {
 	mu          sync.Mutex
 	filePath    string
+	db          *DB
 	feeds       map[int]*FeedSubscription
 	feedCounter int
 	client      *http.Client
@@ -210,6 +211,25 @@ func NewFeedManager(filePath string, ts *TelegramService) *FeedManager {
 	}
 	_ = fm.LoadState()
 	return fm
+}
+
+func (fm *FeedManager) SetDB(db *DB) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.db = db
+	if db != nil {
+		if feeds, err := db.LoadFeeds(); err == nil && len(feeds) > 0 {
+			fm.feeds = make(map[int]*FeedSubscription, len(feeds))
+			maxID := 0
+			for _, f := range feeds {
+				fm.feeds[f.ID] = f
+				if f.ID > maxID {
+					maxID = f.ID
+				}
+			}
+			fm.feedCounter = maxID
+		}
+	}
 }
 
 func (fm *FeedManager) LoadState() error {
@@ -253,6 +273,11 @@ func (fm *FeedManager) SaveState() {
 }
 
 func (fm *FeedManager) saveStateLocked() {
+	if fm.db != nil {
+		for _, f := range fm.feeds {
+			_ = fm.db.SaveFeed(f)
+		}
+	}
 	if fm.filePath == "" {
 		return
 	}
@@ -408,6 +433,9 @@ func (fm *FeedManager) PauseFeed(id int, userID int64, isOwner bool) (*FeedSubsc
 		return nil, errors.New("unauthorized to modify this feed")
 	}
 	f.Paused = true
+	if fm.db != nil {
+		_ = fm.db.SetFeedPaused(id, userID, isOwner, true)
+	}
 	fm.saveStateLocked()
 	return f, nil
 }
@@ -424,6 +452,9 @@ func (fm *FeedManager) ResumeFeed(id int, userID int64, isOwner bool) (*FeedSubs
 		return nil, errors.New("unauthorized to modify this feed")
 	}
 	f.Paused = false
+	if fm.db != nil {
+		_ = fm.db.SetFeedPaused(id, userID, isOwner, false)
+	}
 	fm.saveStateLocked()
 	return f, nil
 }
@@ -440,6 +471,9 @@ func (fm *FeedManager) DeleteFeed(id int, userID int64, isOwner bool) (*FeedSubs
 		return nil, errors.New("unauthorized to delete this feed")
 	}
 	delete(fm.feeds, id)
+	if fm.db != nil {
+		_ = fm.db.DeleteFeed(id, userID, isOwner)
+	}
 	fm.saveStateLocked()
 	return f, nil
 }

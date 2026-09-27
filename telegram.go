@@ -54,8 +54,9 @@ type TelegramService struct {
 		invoker tg.Invoker
 		closer  io.Closer
 	}
-	feedMgr     *FeedManager
+	feedMgr          *FeedManager
 	dmMgr            *DMUserManager
+	db               *DB
 	cfgPath          string
 	botUsername      string
 	groupMemberCache sync.Map
@@ -83,6 +84,19 @@ func NewTelegramService(client *telegram.Client, gdrive *GDriveService, jm *JobM
 	ts.feedMgr = NewFeedManager(cfg.FeedStateFile, ts)
 	ts.downloader = NewLeechPipeline(ts)
 	return ts
+}
+
+func (ts *TelegramService) SetDB(db *DB) {
+	ts.db = db
+	if ts.dmMgr != nil {
+		ts.dmMgr.SetDB(db)
+	}
+	if ts.jm != nil {
+		ts.jm.SetDB(db)
+	}
+	if ts.feedMgr != nil {
+		ts.feedMgr.SetDB(db)
+	}
 }
 
 func (ts *TelegramService) SetTorrentService(svc *TorrentService) {
@@ -210,6 +224,36 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 		}
 	}
 
+	// Bandwidth quota check for task initiation
+	if strings.HasPrefix(text, "/mirror") || strings.HasPrefix(text, "/m ") || text == "/m" ||
+		strings.HasPrefix(text, "/leech") {
+		if ts.db != nil {
+			if allowed, reason := ts.db.CheckQuota(userID, 0); !allowed {
+				mention := ts.formatUserMention(msg, entities, userID)
+				errMsg := fmt.Sprintf("⚠️ %s, bandwidth quota reached: %s", mention, reason)
+				if isGroup {
+					_ = ts.sendDMText(ctx, userID, errMsg)
+					_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
+					return err
+				}
+				_, err := ts.sender.Reply(entities, update).Text(ctx, errMsg)
+				return err
+			}
+		}
+	}
+
+	if strings.HasPrefix(text, "/plan") || strings.HasPrefix(text, "/myplan") {
+		return ts.handlePlanCommand(ctx, msg, entities, update, isGroup, isOwner)
+	}
+
+	if strings.HasPrefix(text, "/setplan") {
+		if !isOwner {
+			_, err := ts.sender.Reply(entities, update).Text(ctx, "❌ This command is restricted to bot owners.")
+			return err
+		}
+		return ts.handleSetPlanCommand(ctx, msg, entities, update, text)
+	}
+
 	if strings.HasPrefix(text, "/help") {
 		helpText := "Available commands:\n" +
 			"/mirror <url> OR reply to media with /mirror [-i count] - Mirror file to Google Drive (in group)\n" +
@@ -219,11 +263,13 @@ func (ts *TelegramService) handleIncomingMessage(ctx context.Context, entities t
 			"/feed add [mirror|leech|notify] [NAME] [URL] [+include] [-exclude]\n" +
 			"/status - View active transfer jobs (in group)\n" +
 			"/cancel <id> - Cancel your active job (in group)\n" +
+			"/plan - View your bandwidth usage & plan limits\n" +
 			"/help - View this message\n\n" +
 			"Owner commands:\n" +
 			"/stats - View system and host performance\n" +
 			"/cancel all - Cancel all active transfer jobs\n" +
 			"/feed list - View all system feed subscriptions\n" +
+			"/setplan <uid> <0-4> - Change user plan tier\n" +
 			"/restart - Restart bot service with state persistence\n" +
 			"/reload - Reload configuration without interruption\n" +
 			"/cleancache - Reclaim temp space, torrent scratch, and memory"
@@ -485,6 +531,93 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 		return ts.sendDMStyled(ctx, userID, opts...)
 	}
 	_, err := ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	return err
+}
+
+func (ts *TelegramService) handlePlanCommand(ctx context.Context, msg *tg.Message, entities tg.Entities, update message.AnswerableMessageUpdate, isGroup bool, isOwner bool) error {
+	userID := getSenderID(msg)
+	if ts.db == nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Database accounting is not enabled.")
+		return err
+	}
+	user, err := ts.db.GetUser(userID)
+	if err != nil || user == nil {
+		if isGroup {
+			return ts.sendDMText(ctx, userID, "⚠️ Profile not found. Please /start the bot in DM first.")
+		}
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "⚠️ Profile not found. Please /start the bot in DM first.")
+		return err
+	}
+
+	dailyLimit, monthlyLimit := PlanLimits(user.Plan)
+	dailyLimitStr := "Unlimited"
+	if dailyLimit > 0 {
+		dailyLimitStr = FormatBytes(dailyLimit)
+	}
+	monthlyLimitStr := "Unlimited"
+	if monthlyLimit > 0 {
+		monthlyLimitStr = FormatBytes(monthlyLimit)
+	}
+
+	planName := user.Plan.String()
+	expiryStr := "Permanent"
+	if user.PlanExpiryAt != nil {
+		expiryStr = user.PlanExpiryAt.Format("2006-01-02 15:04 UTC")
+	}
+
+	opts := []styling.StyledTextOption{
+		styling.Bold("Bandwidth & Subscription Plan\n\n"),
+		styling.Bold("User ID: "), styling.Code(fmt.Sprintf("%d", user.ID)), styling.Plain("\n"),
+		styling.Bold("Tier: "), styling.Plain(planName), styling.Plain("\n"),
+		styling.Bold("Daily Quota: "), styling.Plain(fmt.Sprintf("%s / %s\n", FormatBytes(user.DailyBytes), dailyLimitStr)),
+		styling.Bold("Monthly Quota: "), styling.Plain(fmt.Sprintf("%s / %s\n", FormatBytes(user.MonthlyBytes), monthlyLimitStr)),
+		styling.Bold("Lifetime Used: "), styling.Plain(fmt.Sprintf("%s\n", FormatBytes(user.UsedBytes))),
+		styling.Bold("Expiration: "), styling.Plain(expiryStr),
+	}
+
+	if isGroup {
+		_ = ts.sendDMStyled(ctx, userID, opts...)
+		mention := ts.formatUserMention(msg, entities, userID)
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("%s, I have sent your plan details to your DM.", mention))
+		return err
+	}
+	_, err = ts.sender.Reply(entities, update).StyledText(ctx, opts...)
+	return err
+}
+
+func (ts *TelegramService) handleSetPlanCommand(ctx context.Context, msg *tg.Message, entities tg.Entities, update message.AnswerableMessageUpdate, text string) error {
+	if ts.db == nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Database not available.")
+		return err
+	}
+	parts := strings.Fields(text)
+	if len(parts) < 3 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Usage: /setplan <user_id> <0-4> [days]\n\nPlans:\n0: Admin (Unlimited)\n1: Free (10GB daily, 50GB monthly)\n2: Tier 2 (20GB daily, 200GB monthly)\n3: Tier 3 (200GB daily, 2TB monthly)\n4: Unlimited")
+		return err
+	}
+	targetUID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Invalid user_id.")
+		return err
+	}
+	planNum, err := strconv.Atoi(parts[2])
+	if err != nil || planNum < 0 || planNum > 4 {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, "Invalid plan. Choose between 0 and 4.")
+		return err
+	}
+	var expiry *time.Time
+	if len(parts) >= 4 {
+		if days, err := strconv.Atoi(parts[3]); err == nil && days > 0 {
+			exp := time.Now().Add(time.Duration(days) * 24 * time.Hour)
+			expiry = &exp
+		}
+	}
+	err = ts.db.SetUserPlan(targetUID, UserPlan(planNum), expiry)
+	if err != nil {
+		_, err := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error setting plan: %v", err))
+		return err
+	}
+	_, err = ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("✅ Set plan for user %d to %s", targetUID, UserPlan(planNum).String()))
 	return err
 }
 
@@ -1124,6 +1257,7 @@ func (ts *TelegramService) RegisterBotCommands(ctx context.Context) error {
 		{Command: "feed", Description: "Manage RSS/Atom release feeds"},
 		{Command: "status", Description: "View active transfer jobs"},
 		{Command: "cancel", Description: "Cancel your active job"},
+		{Command: "plan", Description: "View bandwidth quota & subscription plan"},
 		{Command: "cancelall", Description: "Cancel all transfer jobs (Owner)"},
 		{Command: "stats", Description: "View system and host performance (Owner)"},
 		{Command: "restart", Description: "Restart bot service with state persistence (Owner)"},
@@ -1292,6 +1426,9 @@ func (ts *TelegramService) sendTargetFailure(target JobTarget, name string, acti
 func (ts *TelegramService) sendJobFailure(job *Job, err error) {
 	if job == nil || err == nil || errors.Is(err, context.Canceled) || job.Status == "Cancelled" || job.State == StateCancelled {
 		return
+	}
+	if ts.db != nil {
+		_ = ts.db.CompleteJob(job.ID, "failed", err.Error(), job.Size)
 	}
 	name := job.FileName
 	action := string(job.Type)
@@ -1634,6 +1771,10 @@ func (ts *TelegramService) sendMirrorCompletion(ctx context.Context, job *Job, d
 		builder = builder.Markup(replyMarkup)
 	}
 	_, _ = builder.StyledText(ctx, completionOpts...)
+
+	if ts.db != nil && job.Size > 0 {
+		_ = ts.db.AddTraffic(job.UserID, job.Size)
+	}
 }
 
 func extractMediaInfo(media tg.MessageMediaClass) (string, int64, tg.InputFileLocationClass, error) {
@@ -2126,6 +2267,9 @@ func (ts *TelegramService) executeLeechJob(job *Job, rawURL string) {
 	}
 
 	job.Status = "Completed"
+	if ts.db != nil && job.Size > 0 {
+		_ = ts.db.AddTraffic(job.UserID, job.Size)
+	}
 	slog.Info("leech job completed", "job_id", job.ID)
 }
 

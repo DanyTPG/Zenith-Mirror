@@ -22,5 +22,6 @@
   "job_state_file": "jobs_state.json",
   "feed_state_file": "feeds_state.json",
   "feed_check_interval_sec": 600,
-  "dm_users_file": "dm_users.json"
+  "dm_users_file": "dm_users.json",
+  "db_path": "zenith.db"
 }

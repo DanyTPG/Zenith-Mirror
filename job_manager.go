@@ -106,6 +106,7 @@ type JobManager struct {
 	maxConcurrency int
 	jobCounter     uint64
 	stateFilePath  string
+	db             *DB
 }
 
 func NewJobManager(maxConcurrency int) *JobManager {
@@ -119,6 +120,12 @@ func NewJobManager(maxConcurrency int) *JobManager {
 	}
 }
 
+func (jm *JobManager) SetDB(db *DB) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.db = db
+}
+
 func (jm *JobManager) SetStateFile(path string) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
@@ -126,6 +133,14 @@ func (jm *JobManager) SetStateFile(path string) {
 }
 
 func (jm *JobManager) saveStateLocked() {
+	if jm.db != nil {
+		for _, j := range jm.active {
+			_ = jm.db.SaveJob(j)
+		}
+		for _, j := range jm.queue {
+			_ = jm.db.SaveJob(j)
+		}
+	}
 	if jm.stateFilePath == "" {
 		return
 	}
@@ -168,6 +183,10 @@ func (jm *JobManager) LoadPersistedState() ([]PersistedJob, error) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
 
+	if jm.db != nil {
+		return jm.db.LoadActiveJobs()
+	}
+
 	if jm.stateFilePath == "" {
 		return nil, nil
 	}
@@ -198,6 +217,9 @@ func (jm *JobManager) RemovePersistedJob(id string) {
 			jm.queue = append(jm.queue[:i], jm.queue[i+1:]...)
 			break
 		}
+	}
+	if jm.db != nil {
+		_ = jm.db.CompleteJob(id, "cancelled", "Cancelled by user/system", 0)
 	}
 	jm.saveStateLocked()
 }
@@ -307,6 +329,9 @@ func (jm *JobManager) FinishJob(id string) {
 		job.State = StateCompleted
 		delete(jm.active, id)
 		job.Cancel()
+		if jm.db != nil {
+			_ = jm.db.CompleteJob(id, "completed", "", job.Size)
+		}
 	}
 
 	for i, qJob := range jm.queue {

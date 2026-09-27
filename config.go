@@ -66,6 +66,7 @@ type Config struct {
 	FeedStateFile          string    `json:"feed_state_file"`       // persistence file for RSS/Atom feeds (default "feeds_state.json")
 	FeedCheckIntervalSec   int       `json:"feed_check_interval_sec"` // RSS check interval in seconds (default 600)
 	DMUsersFile            string    `json:"dm_users_file"`         // persistence file for users who started DM (default "dm_users.json")
+	DBPath                 string    `json:"db_path"`               // SQLite database file for unified state & accounting (default "zenith.db")
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -149,6 +150,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.DMUsersFile == "" {
 		cfg.DMUsersFile = "dm_users.json"
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = "zenith.db"
 	}
 
 	// Merge all allowed chat ID variations

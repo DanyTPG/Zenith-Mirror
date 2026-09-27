@@ -560,6 +560,9 @@ doneLeech:
 	}
 	job.Status = "Completed"
 	job.ReadBytes = job.Size
+	if ts.db != nil && job.Size > 0 {
+		_ = ts.db.AddTraffic(job.UserID, job.Size)
+	}
 	slog.Info("torrent leech job completed", "job_id", job.ID)
 	cleanupTorrentData(ts.cfg.TorrentDownloadDir, t)
 }

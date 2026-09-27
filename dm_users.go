@@ -21,6 +21,7 @@ type DMUser struct {
 type DMUserManager struct {
 	mu       sync.RWMutex
 	filePath string
+	db       *DB
 	users    map[int64]DMUser
 }
 
@@ -34,6 +35,17 @@ func NewDMUserManager(filePath string) *DMUserManager {
 	}
 	_ = mgr.Load()
 	return mgr
+}
+
+func (m *DMUserManager) SetDB(db *DB) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.db = db
+	if db != nil {
+		if list, err := db.ListDMUsers(); err == nil && len(list) > 0 {
+			m.users = list
+		}
+	}
 }
 
 func (m *DMUserManager) Load() error {
@@ -101,7 +113,12 @@ func (m *DMUserManager) Register(userID, accessHash int64, username, firstName s
 		FirstName:  firstName,
 		StartedAt:  startedAt,
 	}
-	_ = m.SaveLocked()
+
+	if m.db != nil {
+		_ = m.db.UpsertUser(userID, accessHash, username, firstName)
+	} else {
+		_ = m.SaveLocked()
+	}
 }
 
 func (m *DMUserManager) Unregister(userID int64) {
@@ -113,7 +130,11 @@ func (m *DMUserManager) Unregister(userID int64) {
 
 	if _, ok := m.users[userID]; ok {
 		delete(m.users, userID)
-		_ = m.SaveLocked()
+		if m.db != nil {
+			_ = m.db.UnregisterDM(userID)
+		} else {
+			_ = m.SaveLocked()
+		}
 	}
 }
 

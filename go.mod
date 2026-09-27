@@ -10,6 +10,7 @@ require (
 	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
 	google.golang.org/api v0.291.0
+	modernc.org/sqlite v1.36.0
 )
 
 require (

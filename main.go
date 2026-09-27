@@ -80,6 +80,15 @@ func main() {
 	ts := NewTelegramService(client, gdrive, jm, cfg)
 	ts.SetCfgPath(*cfgPath)
 	ts.SetTorrentService(torrentSvc)
+
+	db, err := OpenDB(cfg.DBPath, cfg)
+	if err != nil {
+		slog.Error("failed initializing sqlite database", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	ts.SetDB(db)
+
 	ts.RegisterHandlers(dispatcher)
 
 	errCh := make(chan error, 1)

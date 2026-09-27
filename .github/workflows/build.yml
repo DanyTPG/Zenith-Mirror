@@ -48,6 +48,14 @@ jobs:
           go build -trimpath -ldflags="$LDFLAGS" -o zenith-mirror-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} . 2>&1 | tee /tmp/build.log
           exit ${PIPESTATUS[0]}
 
+      - name: Publish failure log
+        if: failure() && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete failure-log --cleanup-tag -y || true
+          gh release create failure-log /tmp/build.log --title "Test Failure Log" --notes-file /tmp/build.log || true
+
       - name: Upload error on failure
         if: failure()
         uses: actions/upload-artifact@v4

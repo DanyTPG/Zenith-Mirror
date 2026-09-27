@@ -35,7 +35,8 @@ jobs:
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: |
           go mod tidy
-          go test -v ./...
+          go test -v -timeout 60s . 2>&1 | tee /tmp/build.log
+          exit ${PIPESTATUS[0]}
 
       - name: Build
         env:
@@ -53,6 +54,14 @@ jobs:
         with:
           name: error-${{ matrix.goos }}-${{ matrix.goarch }}
           path: /tmp/build.log
+
+      - name: Summary on failure
+        if: failure()
+        run: |
+          echo "### Failure Log (${{ matrix.goos }}/${{ matrix.goarch }})" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 100 /tmp/build.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -226,12 +226,17 @@ func (c *Config) Reload(path string) error {
 }
 
 func (c *Config) IsOwner(userID int64) bool {
-	if userID == 0 {
+	if userID == 0 || c == nil {
 		return false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, id := range c.OwnerID {
+		if id == userID {
+			return true
+		}
+	}
+	for _, id := range c.OwnerIDs {
 		if id == userID {
 			return true
 		}

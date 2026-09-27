@@ -11,6 +11,7 @@ func TestDatabaseUsersAndQuotas(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "test_zenith.db")
 
 	cfg := &Config{
+		OwnerID:  []int64{100},
 		OwnerIDs: []int64{100},
 	}
 

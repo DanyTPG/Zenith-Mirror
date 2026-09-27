@@ -535,7 +535,7 @@ func (ts *TelegramService) handleStats(ctx context.Context, entities tg.Entities
 }
 
 func (ts *TelegramService) handlePlanCommand(ctx context.Context, msg *tg.Message, entities tg.Entities, update message.AnswerableMessageUpdate, isGroup bool, isOwner bool) error {
-	userID := getSenderID(msg)
+	userID := ts.getUserID(msg)
 	if ts.db == nil {
 		_, err := ts.sender.Reply(entities, update).Text(ctx, "Database accounting is not enabled.")
 		return err

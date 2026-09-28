@@ -2558,12 +2558,24 @@ func (ts *TelegramService) handleFeedCallback(ctx context.Context, entities tg.E
 			if feed == nil {
 				toast = "Feed not found"
 			} else {
-				toast = fmt.Sprintf("Checking #%d (%s)...", feed.ID, feed.Name)
-				go func() {
-					checkCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-					defer cancel()
-					_, _ = ts.feedMgr.CheckFeed(checkCtx, feed)
-				}()
+				checkCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				matches, err := ts.feedMgr.CheckFeed(checkCtx, feed)
+				cancel()
+				if err != nil {
+					toast = fmt.Sprintf("Error checking #%d: %v", feed.ID, err)
+				} else if matches > 0 {
+					toast = fmt.Sprintf("Checked #%d: %d new match(es) queued!", feed.ID, matches)
+				} else {
+					latest := feed.LastTitle
+					if len(latest) > 45 {
+						latest = latest[:42] + "..."
+					}
+					if latest != "" {
+						toast = fmt.Sprintf("No new items (Latest: %s)", latest)
+					} else {
+						toast = "Checked: No items found."
+					}
+				}
 			}
 		}
 	case "list":
@@ -2815,8 +2827,13 @@ func (ts *TelegramService) buildFeedListMessage(userID int64, isOwner bool) (str
 			filterStr = " None"
 		}
 
-		sb.WriteString(fmt.Sprintf("#%d %s [%s]\nStatus: %s | Checked: %s\nFilters:%s\nURL: %s\n\n",
-			f.ID, f.Name, strings.ToUpper(string(f.Mode)), status, checkedStr, filterStr, f.URL))
+		lastTitleStr := f.LastTitle
+		if lastTitleStr == "" {
+			lastTitleStr = "None"
+		}
+
+		sb.WriteString(fmt.Sprintf("#%d %s [%s]\nStatus: %s | Checked: %s\nFilters:%s\nLast: %s\nURL: %s\n\n",
+			f.ID, f.Name, strings.ToUpper(string(f.Mode)), status, checkedStr, filterStr, lastTitleStr, f.URL))
 
 		var btnPause tg.KeyboardButtonClass
 		if f.Paused {

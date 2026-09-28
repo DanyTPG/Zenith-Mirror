@@ -590,12 +590,20 @@ func (d *DB) SaveFeed(f *FeedSubscription) error {
 	}
 
 	_, err := d.db.Exec(`
-		UPDATE feeds SET
-			name = ?, mode = ?, url = ?, includes = ?, excludes = ?,
-			last_guid = ?, last_title = ?, target_json = ?, paused = ?, last_checked = ?
-		WHERE id = ?;`,
-		f.Name, string(f.Mode), f.URL, includesStr, excludesStr,
-		f.LastGUID, f.LastTitle, string(targetData), pausedInt, f.LastChecked, f.ID,
+		INSERT INTO feeds (id, user_id, name, mode, url, includes, excludes, last_guid, last_title, target_json, paused, last_checked, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			mode = excluded.mode,
+			url = excluded.url,
+			includes = excluded.includes,
+			excludes = excluded.excludes,
+			last_guid = excluded.last_guid,
+			last_title = excluded.last_title,
+			target_json = excluded.target_json,
+			paused = excluded.paused,
+			last_checked = excluded.last_checked;`,
+		f.ID, f.UserID, f.Name, string(f.Mode), f.URL, includesStr, excludesStr, f.LastGUID, f.LastTitle, string(targetData), pausedInt, f.LastChecked,
 	)
 	return err
 }

@@ -1695,7 +1695,7 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		target := ts.extractJobTarget(msg, entities)
 		loc := locationToStored(location)
 
-		job, err := ts.jm.CreateJob(ctx, JobOptions{
+		_, err := ts.jm.CreateJob(ctx, JobOptions{
 			Type:     JobTypeMirror,
 			Kind:     "tg_mirror",
 			FileName: fileName,

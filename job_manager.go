@@ -289,7 +289,9 @@ func (jm *JobManager) CreateJob(ctx context.Context, opts JobOptions) (*Job, err
 	if runningCount < jm.maxConcurrency {
 		job.State = StateRunning
 		job.Status = "Running"
-		go job.Execute()
+		if job.Execute != nil {
+			go job.Execute()
+		}
 	} else {
 		jm.queue = append(jm.queue, job)
 	}
@@ -345,7 +347,9 @@ func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, e
 	if runningCount < jm.maxConcurrency {
 		job.State = StateRunning
 		job.Status = "Running"
-		go job.Execute()
+		if job.Execute != nil {
+			go job.Execute()
+		}
 	} else {
 		jm.queue = append(jm.queue, job)
 	}
@@ -386,7 +390,9 @@ func (jm *JobManager) FinishJob(id string) {
 		jm.queue = jm.queue[1:]
 		nextJob.State = StateRunning
 		nextJob.Status = "Running"
-		go nextJob.Execute()
+		if nextJob.Execute != nil {
+			go nextJob.Execute()
+		}
 	}
 
 	jm.saveStateLocked()
@@ -424,7 +430,9 @@ func (jm *JobManager) CancelJob(id string) bool {
 		jm.queue = jm.queue[1:]
 		nextJob.State = StateRunning
 		nextJob.Status = "Running"
-		go nextJob.Execute()
+		if nextJob.Execute != nil {
+			go nextJob.Execute()
+		}
 	}
 
 	jm.saveStateLocked()

@@ -13,18 +13,39 @@ func TestJobManagerConcurrencyAndCancel(t *testing.T) {
 
 	executed := make(chan string, 10)
 
-	j1, err := jm.CreateJob(ctx, JobTypeMirror, "file1.bin", 1000, 1001, func() { executed <- "j1" })
+	j1, err := jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeMirror,
+		Kind:     "url_mirror",
+		FileName: "file1.bin",
+		Size:     1000,
+		UserID:   1001,
+		Execute:  func(j *Job) { executed <- "j1" },
+	})
 	if err != nil {
 		t.Fatalf("failed creating j1: %v", err)
 	}
 
-	j2, err := jm.CreateJob(ctx, JobTypeMirror, "file2.bin", 2000, 1001, func() { executed <- "j2" })
+	j2, err := jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeMirror,
+		Kind:     "url_mirror",
+		FileName: "file2.bin",
+		Size:     2000,
+		UserID:   1001,
+		Execute:  func(j *Job) { executed <- "j2" },
+	})
 	if err != nil {
 		t.Fatalf("failed creating j2: %v", err)
 	}
 
 	// 3rd job should be queued because max_concurrency = 2
-	j3, err := jm.CreateJob(ctx, JobTypeMirror, "file3.bin", 3000, 1001, func() { executed <- "j3" })
+	j3, err := jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeMirror,
+		Kind:     "url_mirror",
+		FileName: "file3.bin",
+		Size:     3000,
+		UserID:   1001,
+		Execute:  func(j *Job) { executed <- "j3" },
+	})
 	if err != nil {
 		t.Fatalf("failed creating j3: %v", err)
 	}
@@ -64,13 +85,18 @@ func TestJobManagerPersistence(t *testing.T) {
 	jm1.SetStateFile(stateFile)
 
 	ctx := context.Background()
-	j, err := jm1.CreateJob(ctx, JobTypeMirror, "test.bin", 12345, 999, func() {})
+	j, err := jm1.CreateJob(ctx, JobOptions{
+		Type:     JobTypeMirror,
+		Kind:     "url_mirror",
+		FileName: "test.bin",
+		Size:     12345,
+		UserID:   999,
+		RawURL:   "https://example.com/test.bin",
+		Target:   JobTarget{PeerType: "user", UserID: 999, ReplyMsgID: 42},
+	})
 	if err != nil {
 		t.Fatalf("failed creating job: %v", err)
 	}
-	j.Kind = "url_mirror"
-	j.RawURL = "https://example.com/test.bin"
-	j.Target = JobTarget{PeerType: "user", UserID: 999, ReplyMsgID: 42}
 	jm1.SaveState()
 
 	// Verify file exists and holds state

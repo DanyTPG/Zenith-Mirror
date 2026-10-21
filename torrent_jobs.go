@@ -46,11 +46,19 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 		}
 	}
 	target := ts.extractJobTarget(msg, entities)
-	var jobRef *Job
-	execFn := func() {
-		ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes)
-	}
-	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, displayName, 0, userID, execFn)
+	job, err := ts.jm.CreateJob(ctx, JobOptions{
+		Type:         JobTypeMirror,
+		Kind:         "torrent_mirror",
+		FileName:     displayName,
+		UserID:       userID,
+		Target:       target,
+		MagnetURI:    magnetURI,
+		TorrentBytes: torrentBytes,
+		IsTorrent:    true,
+		Execute: func(j *Job) {
+			ts.executeTorrentMirrorJob(j, magnetURI, torrentBytes)
+		},
+	})
 	if err != nil {
 		slog.Error("failed creating torrent mirror job", "error", err)
 		if isGroupPeer(msg.PeerID) {
@@ -60,13 +68,6 @@ func (ts *TelegramService) handleTorrentMirror(ctx context.Context, entities tg.
 		}
 		return err
 	}
-	job.IsTorrent = true
-	job.Kind = "torrent_mirror"
-	job.Target = target
-	job.MagnetURI = magnetURI
-	job.TorrentBytes = torrentBytes
-	ts.jm.SaveState()
-	jobRef = job
 	slog.Info("torrent mirror job created", "job_id", job.ID, "name", displayName)
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))
@@ -101,11 +102,19 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 		displayName = displayName[:60] + "..."
 	}
 	target := ts.extractJobTarget(msg, entities)
-	var jobRef *Job
-	execFn := func() {
-		ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes)
-	}
-	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, displayName, 0, userID, execFn)
+	job, err := ts.jm.CreateJob(ctx, JobOptions{
+		Type:         JobTypeLeech,
+		Kind:         "torrent_leech",
+		FileName:     displayName,
+		UserID:       userID,
+		Target:       target,
+		MagnetURI:    magnetURI,
+		TorrentBytes: torrentBytes,
+		IsTorrent:    true,
+		Execute: func(j *Job) {
+			ts.executeTorrentLeechJob(j, magnetURI, torrentBytes)
+		},
+	})
 	if err != nil {
 		slog.Error("failed creating torrent leech job", "error", err)
 		if isGroupPeer(msg.PeerID) {
@@ -115,13 +124,6 @@ func (ts *TelegramService) handleTorrentLeech(ctx context.Context, entities tg.E
 		}
 		return err
 	}
-	job.IsTorrent = true
-	job.Kind = "torrent_leech"
-	job.Target = target
-	job.MagnetURI = magnetURI
-	job.TorrentBytes = torrentBytes
-	ts.jm.SaveState()
-	jobRef = job
 	slog.Info("torrent leech job created", "job_id", job.ID, "name", displayName)
 	if isGroupPeer(msg.PeerID) {
 		_ = ts.sendDMText(ctx, userID, fmt.Sprintf("📥 Torrent queued: %s", displayName))

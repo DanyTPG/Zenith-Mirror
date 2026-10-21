@@ -67,6 +67,21 @@ type PersistedJob struct {
 	CreatedAt    time.Time       `json:"created_at"`
 }
 
+type JobOptions struct {
+	Type         JobType
+	Kind         string
+	FileName     string
+	Size         int64
+	UserID       int64
+	Target       JobTarget
+	RawURL       string
+	MagnetURI    string
+	TorrentBytes []byte
+	Location     *StoredLocation
+	IsTorrent    bool
+	Execute      func(j *Job)
+}
+
 type Job struct {
 	ID        string
 	Type      JobType
@@ -224,7 +239,7 @@ func (jm *JobManager) RemovePersistedJob(id string) {
 	jm.saveStateLocked()
 }
 
-func (jm *JobManager) CreateJob(ctx context.Context, jobType JobType, fileName string, size int64, userID int64, execute func()) (*Job, error) {
+func (jm *JobManager) CreateJob(ctx context.Context, opts JobOptions) (*Job, error) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
 
@@ -233,19 +248,33 @@ func (jm *JobManager) CreateJob(ctx context.Context, jobType JobType, fileName s
 
 	jobCtx, cancel := context.WithCancel(ctx)
 
+	isTorrent := opts.IsTorrent
+	if opts.Kind == "torrent_mirror" || opts.Kind == "torrent_leech" {
+		isTorrent = true
+	}
+
 	job := &Job{
-		ID:        id,
-		Type:      jobType,
-		FileName:  fileName,
-		Size:      size,
-		Phase:     PhaseDownloading,
-		State:     StateQueued,
-		Status:    "Queued",
-		UserID:    userID,
-		Order:     int(jm.jobCounter),
-		Ctx:       jobCtx,
-		Cancel:    cancel,
-		Execute:   execute,
+		ID:           id,
+		Type:         opts.Type,
+		Kind:         opts.Kind,
+		FileName:     opts.FileName,
+		Size:         opts.Size,
+		Phase:        PhaseDownloading,
+		State:        StateQueued,
+		Status:       "Queued",
+		UserID:       opts.UserID,
+		Target:       opts.Target,
+		RawURL:       opts.RawURL,
+		MagnetURI:    opts.MagnetURI,
+		TorrentBytes: opts.TorrentBytes,
+		Location:     opts.Location,
+		IsTorrent:    isTorrent,
+		Order:        int(jm.jobCounter),
+		Ctx:          jobCtx,
+		Cancel:       cancel,
+	}
+	if opts.Execute != nil {
+		job.Execute = func() { opts.Execute(job) }
 	}
 
 	jm.active[id] = job
@@ -269,7 +298,7 @@ func (jm *JobManager) CreateJob(ctx context.Context, jobType JobType, fileName s
 	return job, nil
 }
 
-func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, execute func()) (*Job, error) {
+func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, execute func(j *Job)) (*Job, error) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
 
@@ -279,6 +308,7 @@ func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, e
 	}
 
 	jobCtx, cancel := context.WithCancel(ctx)
+	isTorrent := pj.Kind == "torrent_mirror" || pj.Kind == "torrent_leech"
 	job := &Job{
 		ID:           pj.ID,
 		Type:         pj.Type,
@@ -294,10 +324,13 @@ func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, e
 		MagnetURI:    pj.MagnetURI,
 		TorrentBytes: pj.TorrentBytes,
 		Location:     pj.Location,
+		IsTorrent:    isTorrent,
 		Order:        int(jm.jobCounter),
 		Ctx:          jobCtx,
 		Cancel:       cancel,
-		Execute:      execute,
+	}
+	if execute != nil {
+		job.Execute = func() { execute(job) }
 	}
 
 	jm.active[pj.ID] = job
@@ -311,7 +344,7 @@ func (jm *JobManager) CreateRecoveredJob(ctx context.Context, pj PersistedJob, e
 
 	if runningCount < jm.maxConcurrency {
 		job.State = StateRunning
-		job.Status = "Resuming"
+		job.Status = "Running"
 		go job.Execute()
 	} else {
 		jm.queue = append(jm.queue, job)

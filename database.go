@@ -483,8 +483,12 @@ func (d *DB) SaveJob(job *Job) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			status = excluded.status,
+			kind = excluded.kind,
 			file_name = excluded.file_name,
 			size = excluded.size,
+			raw_url = excluded.raw_url,
+			magnet_uri = excluded.magnet_uri,
+			torrent_bytes = excluded.torrent_bytes,
 			target_json = excluded.target_json,
 			location_json = excluded.location_json;`,
 		job.ID, job.UserID, string(job.Type), job.Kind, status, job.FileName, job.Size,

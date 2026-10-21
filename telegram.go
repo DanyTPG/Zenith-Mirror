@@ -1547,14 +1547,19 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		}
 
 		fileName := ExtractFileName(rawURL, "")
-
 		target := ts.extractJobTarget(msg, entities)
-		var jobRef *Job
-		execFunc := func() {
-			ts.executeURLMirrorJob(jobRef, rawURL)
-		}
 
-		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, 0, userID, execFunc)
+		job, err := ts.jm.CreateJob(ctx, JobOptions{
+			Type:     JobTypeMirror,
+			Kind:     "url_mirror",
+			FileName: fileName,
+			UserID:   userID,
+			Target:   target,
+			RawURL:   rawURL,
+			Execute: func(j *Job) {
+				ts.executeURLMirrorJob(j, rawURL)
+			},
+		})
 		if err != nil {
 			slog.Error("failed creating URL mirror job", "error", err)
 			if isGroupPeer(msg.PeerID) {
@@ -1564,11 +1569,6 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 			return replyErr
 		}
-		job.Kind = "url_mirror"
-		job.Target = target
-		job.RawURL = rawURL
-		ts.jm.SaveState()
-		jobRef = job
 
 		slog.Info("url mirror job created", "job_id", job.ID, "url", rawURL)
 		if isGroupPeer(msg.PeerID) {
@@ -1693,21 +1693,24 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		}
 
 		target := ts.extractJobTarget(msg, entities)
-		var jobRef *Job
-		execFunc := func() {
-			ts.executeMirrorJob(jobRef, location)
-		}
+		loc := locationToStored(location)
 
-		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, fileName, fileSize, userID, execFunc)
+		job, err := ts.jm.CreateJob(ctx, JobOptions{
+			Type:     JobTypeMirror,
+			Kind:     "tg_mirror",
+			FileName: fileName,
+			Size:     fileSize,
+			UserID:   userID,
+			Target:   target,
+			Location: loc,
+			Execute: func(j *Job) {
+				ts.executeMirrorJob(j, location)
+			},
+		})
 		if err != nil {
 			slog.Warn("could not create mirror job", "msg_id", targetID, "error", err)
 			continue
 		}
-		job.Kind = "tg_mirror"
-		job.Target = target
-		job.Location = locationToStored(location)
-		ts.jm.SaveState()
-		jobRef = job
 
 		queuedJobs++
 	}
@@ -2171,13 +2174,19 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 	}
 
 	target := ts.extractJobTarget(msg, entities)
-	var jobRef *Job
-	execFunc := func() {
-		ts.executeLeechJob(jobRef, rawURL)
-	}
-
 	fileName := ExtractFileName(rawURL, "")
-	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, fileName, 0, userID, execFunc)
+
+	job, err := ts.jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeLeech,
+		Kind:     "url_leech",
+		FileName: fileName,
+		UserID:   userID,
+		Target:   target,
+		RawURL:   rawURL,
+		Execute: func(j *Job) {
+			ts.executeLeechJob(j, rawURL)
+		},
+	})
 	if err != nil {
 		slog.Error("failed creating leech job", "error", err)
 		if isGroupPeer(msg.PeerID) {
@@ -2187,11 +2196,6 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 		_, replyErr := ts.sender.Reply(entities, update).Text(ctx, fmt.Sprintf("Error creating job: %v", err))
 		return replyErr
 	}
-	job.Kind = "url_leech"
-	job.Target = target
-	job.RawURL = rawURL
-	ts.jm.SaveState()
-	jobRef = job
 
 	slog.Info("leech job created", "job_id", job.ID, "url", rawURL)
 	if isGroupPeer(msg.PeerID) {
@@ -2406,6 +2410,24 @@ func (ts *TelegramService) RecoverJobs(ctx context.Context) {
 
 	for _, rec := range records {
 		r := rec
+		if r.Kind == "" {
+			if r.Location != nil {
+				r.Kind = "tg_mirror"
+			} else if r.MagnetURI != "" || len(r.TorrentBytes) > 0 {
+				if r.Type == JobTypeLeech {
+					r.Kind = "torrent_leech"
+				} else {
+					r.Kind = "torrent_mirror"
+				}
+			} else if r.RawURL != "" {
+				if r.Type == JobTypeLeech {
+					r.Kind = "url_leech"
+				} else {
+					r.Kind = "url_mirror"
+				}
+			}
+		}
+
 		switch r.Kind {
 		case "url_mirror", "url_leech":
 			if r.RawURL == "" {
@@ -2466,33 +2488,31 @@ func (ts *TelegramService) RecoverJobs(ctx context.Context) {
 
 		go ts.startLiveStatusUpdater(r.Target)
 
-		var jobRef *Job
-		var execFunc func()
+		var execFunc func(j *Job)
 		switch r.Kind {
 		case "url_mirror":
-			execFunc = func() { ts.executeURLMirrorJob(jobRef, r.RawURL) }
+			execFunc = func(j *Job) { ts.executeURLMirrorJob(j, r.RawURL) }
 		case "url_leech":
-			execFunc = func() { ts.executeLeechJob(jobRef, r.RawURL) }
+			execFunc = func(j *Job) { ts.executeLeechJob(j, r.RawURL) }
 		case "tg_mirror":
-			execFunc = func() { ts.executeMirrorJob(jobRef, storedToLocation(r.Location)) }
+			execFunc = func(j *Job) { ts.executeMirrorJob(j, storedToLocation(r.Location)) }
 		case "torrent_mirror":
-			execFunc = func() { ts.executeTorrentMirrorJob(jobRef, r.MagnetURI, r.TorrentBytes) }
+			execFunc = func(j *Job) { ts.executeTorrentMirrorJob(j, r.MagnetURI, r.TorrentBytes) }
 		case "torrent_leech":
-			execFunc = func() { ts.executeTorrentLeechJob(jobRef, r.MagnetURI, r.TorrentBytes) }
+			execFunc = func(j *Job) { ts.executeTorrentLeechJob(j, r.MagnetURI, r.TorrentBytes) }
 		default:
 			ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), fmt.Errorf("unknown job kind: %s", r.Kind))
 			ts.jm.RemovePersistedJob(r.ID)
 			continue
 		}
 
-		job, err := ts.jm.CreateRecoveredJob(ctx, r, execFunc)
+		_, err := ts.jm.CreateRecoveredJob(ctx, r, execFunc)
 		if err != nil {
 			slog.Error("failed recreating recovered job", "job_id", r.ID, "error", err)
 			ts.sendTargetFailure(r.Target, r.FileName, string(r.Type), fmt.Errorf("failed recovering job: %w", err))
 			ts.jm.RemovePersistedJob(r.ID)
 			continue
 		}
-		jobRef = job
 	}
 }
 
@@ -2887,40 +2907,42 @@ func (ts *TelegramService) createFeedMirrorJob(ctx context.Context, f *FeedSubsc
 			}
 		}
 
-		var jobRef *Job
-		execFn := func() {
-			ts.executeTorrentMirrorJob(jobRef, magnetURI, torrentBytes)
-		}
-		job, err := ts.jm.CreateJob(ctx, JobTypeMirror, title, 0, f.UserID, execFn)
+		_, err := ts.jm.CreateJob(ctx, JobOptions{
+			Type:         JobTypeMirror,
+			Kind:         "torrent_mirror",
+			FileName:     title,
+			UserID:       f.UserID,
+			Target:       f.Target,
+			MagnetURI:    magnetURI,
+			TorrentBytes: torrentBytes,
+			IsTorrent:    true,
+			Execute: func(j *Job) {
+				ts.executeTorrentMirrorJob(j, magnetURI, torrentBytes)
+			},
+		})
 		if err != nil {
 			ts.sendTargetFailure(f.Target, title, "Feed Mirror", err)
 			return
 		}
-		job.IsTorrent = true
-		job.Kind = "torrent_mirror"
-		job.Target = f.Target
-		job.MagnetURI = magnetURI
-		job.TorrentBytes = torrentBytes
-		ts.jm.SaveState()
-		jobRef = job
 		go ts.startLiveStatusUpdater(f.Target)
 		return
 	}
 
-	var jobRef *Job
-	execFn := func() {
-		ts.executeURLMirrorJob(jobRef, link)
-	}
-	job, err := ts.jm.CreateJob(ctx, JobTypeMirror, title, 0, f.UserID, execFn)
+	_, err := ts.jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeMirror,
+		Kind:     "url_mirror",
+		FileName: title,
+		UserID:   f.UserID,
+		Target:   f.Target,
+		RawURL:   link,
+		Execute: func(j *Job) {
+			ts.executeURLMirrorJob(j, link)
+		},
+	})
 	if err != nil {
 		ts.sendTargetFailure(f.Target, title, "Feed Mirror", err)
 		return
 	}
-	job.Kind = "url_mirror"
-	job.Target = f.Target
-	job.RawURL = link
-	ts.jm.SaveState()
-	jobRef = job
 	go ts.startLiveStatusUpdater(f.Target)
 }
 
@@ -2951,40 +2973,42 @@ func (ts *TelegramService) createFeedLeechJob(ctx context.Context, f *FeedSubscr
 			}
 		}
 
-		var jobRef *Job
-		execFn := func() {
-			ts.executeTorrentLeechJob(jobRef, magnetURI, torrentBytes)
-		}
-		job, err := ts.jm.CreateJob(ctx, JobTypeLeech, title, 0, f.UserID, execFn)
+		_, err := ts.jm.CreateJob(ctx, JobOptions{
+			Type:         JobTypeLeech,
+			Kind:         "torrent_leech",
+			FileName:     title,
+			UserID:       f.UserID,
+			Target:       f.Target,
+			MagnetURI:    magnetURI,
+			TorrentBytes: torrentBytes,
+			IsTorrent:    true,
+			Execute: func(j *Job) {
+				ts.executeTorrentLeechJob(j, magnetURI, torrentBytes)
+			},
+		})
 		if err != nil {
 			ts.sendTargetFailure(f.Target, title, "Feed Leech", err)
 			return
 		}
-		job.IsTorrent = true
-		job.Kind = "torrent_leech"
-		job.Target = f.Target
-		job.MagnetURI = magnetURI
-		job.TorrentBytes = torrentBytes
-		ts.jm.SaveState()
-		jobRef = job
 		go ts.startLiveStatusUpdater(f.Target)
 		return
 	}
 
-	var jobRef *Job
-	execFn := func() {
-		ts.executeLeechJob(jobRef, link)
-	}
-	job, err := ts.jm.CreateJob(ctx, JobTypeLeech, title, 0, f.UserID, execFn)
+	_, err := ts.jm.CreateJob(ctx, JobOptions{
+		Type:     JobTypeLeech,
+		Kind:     "url_leech",
+		FileName: title,
+		UserID:   f.UserID,
+		Target:   f.Target,
+		RawURL:   link,
+		Execute: func(j *Job) {
+			ts.executeLeechJob(j, link)
+		},
+	})
 	if err != nil {
 		ts.sendTargetFailure(f.Target, title, "Feed Leech", err)
 		return
 	}
-	job.Kind = "url_leech"
-	job.Target = f.Target
-	job.RawURL = link
-	ts.jm.SaveState()
-	jobRef = job
 	go ts.startLiveStatusUpdater(f.Target)
 }
 

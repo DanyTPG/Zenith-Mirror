@@ -1588,9 +1588,9 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 			var res tg.MessagesMessagesClass
 			var err error
 			if channelID != 0 {
-				res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}}})
+				res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageReplyTo{ID: msg.ID}}})
 			} else {
-				res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}})
+				res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageReplyTo{ID: msg.ID}})
 			}
 			if err == nil {
 				var slice []tg.MessageClass
@@ -1649,17 +1649,30 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 	for offset := 0; offset < count; offset++ {
 		targetID := startMsgID + offset
 
+		// The first target is the message this command replies to. Fetch it via
+		// InputMessageReplyTo, not by bare ID: as a bot account the bot cannot
+		// fetch other users' group messages by ID (Telegram returns
+		// MessageEmpty), while reply resolution goes through the command
+		// message, which the bot did receive. Later batch offsets have no
+		// reply link and keep the by-ID fetch.
+		var inputID tg.InputMessageClass
+		if offset == 0 {
+			inputID = &tg.InputMessageReplyTo{ID: msg.ID}
+		} else {
+			inputID = &tg.InputMessageID{ID: targetID}
+		}
+
 		var res tg.MessagesMessagesClass
 		var err error
 
 		if channelID != 0 {
 			res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 				Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash},
-				ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: targetID}},
+				ID:      []tg.InputMessageClass{inputID},
 			})
 		} else {
 			res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{
-				&tg.InputMessageID{ID: targetID},
+				inputID,
 			})
 		}
 
@@ -1679,16 +1692,19 @@ func (ts *TelegramService) handleMirror(ctx context.Context, entities tg.Entitie
 		}
 
 		if len(messagesSlice) == 0 {
+			slog.Warn("mirror: skipping message, fetch returned no messages", "msg_id", targetID)
 			continue
 		}
 
 		targetMsg, ok := messagesSlice[0].(*tg.Message)
 		if !ok || targetMsg.Media == nil {
+			slog.Warn("mirror: skipping message, not a media message", "msg_id", targetID, "returned_type", fmt.Sprintf("%T", messagesSlice[0]))
 			continue
 		}
 
 		fileName, fileSize, location, err := extractMediaInfo(targetMsg.Media)
 		if err != nil {
+			slog.Warn("mirror: skipping message, media not downloadable", "msg_id", targetID, "media_type", fmt.Sprintf("%T", targetMsg.Media), "error", err)
 			continue
 		}
 
@@ -2121,9 +2137,9 @@ func (ts *TelegramService) handleLeech(ctx context.Context, entities tg.Entities
 				var res tg.MessagesMessagesClass
 				var err error
 				if channelID != 0 {
-					res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}}})
+					res, err = ts.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID, AccessHash: accessHash}, ID: []tg.InputMessageClass{&tg.InputMessageReplyTo{ID: msg.ID}}})
 				} else {
-					res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: rh.ReplyToMsgID}})
+					res, err = ts.client.API().MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageReplyTo{ID: msg.ID}})
 				}
 				if err == nil {
 					var slice []tg.MessageClass

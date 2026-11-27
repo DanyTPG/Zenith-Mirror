@@ -1427,9 +1427,12 @@ func (ts *TelegramService) sendJobFailure(job *Job, err error) {
 	if job == nil || err == nil || errors.Is(err, context.Canceled) || job.Status == "Cancelled" || job.State == StateCancelled {
 		return
 	}
-	if ts.db != nil {
-		_ = ts.db.CompleteJob(job.ID, "failed", err.Error(), job.Size)
-	}
+	// Mark the job failed in memory only. FinishJob persists the terminal
+	// status when the executor returns; writing the DB here would be undone
+	// by the next SaveJob upsert while the job is still active, resurrecting
+	// the job on the next restart.
+	job.State = StateFailed
+	job.FailReason = err.Error()
 	name := job.FileName
 	action := string(job.Type)
 	ts.sendTargetFailure(job.Target, name, action, err)

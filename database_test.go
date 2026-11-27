@@ -137,6 +137,53 @@ func TestDatabaseJobsPersistence(t *testing.T) {
 	}
 }
 
+// Regression test for the job resurrection bug: once a job reaches a
+// terminal status (completed/failed/cancelled), a later SaveJob upsert
+// carrying a stale in-memory 'running' state must not flip its row back
+// to active, or LoadActiveJobs would recover it on the next restart.
+func TestDatabaseJobTerminalStatusIsSticky(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_jobs_sticky.db")
+
+	db, err := OpenDB(dbPath, nil)
+	if err != nil {
+		t.Fatalf("failed opening test db: %v", err)
+	}
+	defer db.Close()
+
+	for _, terminal := range []string{"completed", "failed", "cancelled"} {
+		job := &Job{
+			ID:       "job-" + terminal,
+			UserID:   200,
+			Type:     JobTypeMirror,
+			Kind:     "url_mirror",
+			FileName: "test.iso",
+			Size:     1024,
+			State:    StateRunning,
+		}
+		if err := db.SaveJob(job); err != nil {
+			t.Fatalf("failed saving job: %v", err)
+		}
+		if err := db.CompleteJob(job.ID, terminal, "", 1024); err != nil {
+			t.Fatalf("failed marking job %s: %v", terminal, err)
+		}
+		// Simulate the periodic saver re-saving the still-active in-memory
+		// job with its stale running state.
+		if err := db.SaveJob(job); err != nil {
+			t.Fatalf("failed re-saving job: %v", err)
+		}
+		active, err := db.LoadActiveJobs()
+		if err != nil {
+			t.Fatalf("failed loading active jobs: %v", err)
+		}
+		for _, a := range active {
+			if a.ID == job.ID {
+				t.Fatalf("job %s resurrected after %s: present in active jobs", job.ID, terminal)
+			}
+		}
+	}
+}
+
 func TestDatabaseFeedsPersistence(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_feeds.db")

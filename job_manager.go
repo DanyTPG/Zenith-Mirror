@@ -31,6 +31,7 @@ const (
 	StateRunning   JobState = "RUNNING"
 	StateCancelled JobState = "CANCELLED"
 	StateCompleted JobState = "COMPLETED"
+	StateFailed    JobState = "FAILED"
 )
 
 type JobTarget struct {
@@ -94,6 +95,7 @@ type Job struct {
 	Phase     JobPhase
 	State     JobState
 	Status    string
+	FailReason string
 	UserID    int64
 	Target    JobTarget
 	Order     int
@@ -363,11 +365,25 @@ func (jm *JobManager) FinishJob(id string) {
 	defer jm.mu.Unlock()
 
 	if job, ok := jm.active[id]; ok {
-		job.State = StateCompleted
+		// Record the job's real outcome: sendJobFailure marks failed jobs
+		// StateFailed, CancelJob marks them StateCancelled. Anything else
+		// that reaches FinishJob completed successfully.
+		status := "completed"
+		errMsg := ""
+		switch job.State {
+		case StateFailed:
+			status = "failed"
+			errMsg = job.FailReason
+		case StateCancelled:
+			status = "cancelled"
+			errMsg = "Cancelled"
+		default:
+			job.State = StateCompleted
+		}
 		delete(jm.active, id)
 		job.Cancel()
 		if jm.db != nil {
-			_ = jm.db.CompleteJob(id, "completed", "", job.Size)
+			_ = jm.db.CompleteJob(id, status, errMsg, job.Size)
 		}
 	}
 
@@ -417,6 +433,12 @@ func (jm *JobManager) CancelJob(id string) bool {
 			jm.queue = append(jm.queue[:i], jm.queue[i+1:]...)
 			break
 		}
+	}
+
+	// Persist the terminal status: without this the job's DB row stays
+	// 'running' and the job is recovered on the next restart.
+	if jm.db != nil {
+		_ = jm.db.CompleteJob(id, "cancelled", "Cancelled by user", 0)
 	}
 
 	runningCount := 0
@@ -472,6 +494,9 @@ func (jm *JobManager) CancelAllJobs() int {
 		job.State = StateCancelled
 		job.Status = "Cancelled"
 		job.Cancel()
+		if jm.db != nil {
+			_ = jm.db.CompleteJob(job.ID, "cancelled", "Cancelled by user", 0)
+		}
 	}
 
 	jm.active = make(map[string]*Job)

@@ -490,7 +490,8 @@ func (d *DB) SaveJob(job *Job) error {
 			magnet_uri = excluded.magnet_uri,
 			torrent_bytes = excluded.torrent_bytes,
 			target_json = excluded.target_json,
-			location_json = excluded.location_json;`,
+			location_json = excluded.location_json
+		WHERE jobs.status IN ('queued', 'running');`,
 		job.ID, job.UserID, string(job.Type), job.Kind, status, job.FileName, job.Size,
 		job.RawURL, job.MagnetURI, job.TorrentBytes, string(targetData), string(locData),
 	)
